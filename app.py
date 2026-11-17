@@ -7,7 +7,7 @@ import requests
 
 app = Flask(__name__)
 KENANGA_SOURCE = 'https://www.kenangainvestors.com.my/fund-list'
-KENWEALTH_BASE = 'https://www.kenanga.com.my/online-platforms/kenwealth/pricing-rates/unit-trusts/'
+KENWEALTH_BASE = 'https://www.kenanga.com.my/ms/platform-dalam-talian/kenwealth/pricing-rates/unit-trusts/'
 KENWEALTH_PAGE_HINT = 19
 
 # Exact names prevent mixing similarly named funds or share classes.
@@ -114,14 +114,22 @@ def fetch_kenwealth_prices():
     expected = set(HALOGEN_MAPPING)
     pages_to_try = [KENWEALTH_PAGE_HINT] + [p for p in range(1, 54) if p != KENWEALTH_PAGE_HINT]
     all_found = {}
+    page_errors = []
     for page in pages_to_try:
         url = KENWEALTH_BASE if page == 1 else f'{KENWEALTH_BASE}page/{page}/'
-        response = requests.get(url, timeout=15, headers=HEADERS)
-        response.raise_for_status()
-        page_found = extract_kenwealth_page(response.text)
-        all_found.update(page_found)
+        try:
+            response = requests.get(url, timeout=15, headers=HEADERS)
+            response.raise_for_status()
+            page_found = extract_kenwealth_page(response.text)
+            all_found.update(page_found)
+        except requests.RequestException as exc:
+            # A missing/blocked pagination page must not stop the remaining scan.
+            page_errors.append(f'page {page}: {exc.__class__.__name__}')
+            continue
         if expected.issubset(all_found):
             break
+    if not all_found and page_errors:
+        raise RuntimeError('Kenwealth pages could not be read (' + ', '.join(page_errors[:4]) + ')')
     return all_found
 
 def fetch_source(url):
