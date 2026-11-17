@@ -7,8 +7,8 @@ import requests
 
 app = Flask(__name__)
 KENANGA_SOURCE = 'https://www.kenangainvestors.com.my/fund-list'
-HALOGEN_SOURCE = 'https://www.halogen.my/fund/price'
-KENWEALTH_SOURCE = 'https://www.kenanga.com.my/ms/platform-dalam-talian/kenwealth/pricing-rates/unit-trusts/page/19/'
+KENWEALTH_BASE = 'https://www.kenanga.com.my/online-platforms/kenwealth/pricing-rates/unit-trusts/'
+KENWEALTH_PAGE_HINT = 19
 
 # Exact names prevent mixing similarly named funds or share classes.
 KENANGA_MAPPING = {
@@ -72,76 +72,22 @@ def extract_kenanga(html):
     return found
 
 
-def extract_halogen(html):
-    """Parse only exact fund rows from Halogen's own Daily Fund Price page.
-
-    The publisher currently renders parts of the page dynamically. This parser
-    supports tabular/embedded text representations and fails closed if a dated
-    NAV cannot be identified. It never substitutes an old or guessed price.
-    """
+def extract_kenwealth_page(html):
+    """Extract the two Halogen NAV rows from a Kenwealth Unit Trusts page."""
     soup = BeautifulSoup(html, 'html.parser')
-    aliases = {normalize(alias): display for display, names in HALOGEN_MAPPING.items() for alias in names}
-    found = {}
-
-    # First pass: ordinary HTML tables.
-    for row in soup.select('tr'):
-        cells = row.find_all(['td', 'th'], recursive=False)
-        if not cells:
-            continue
-        cell_texts = [c.get_text(' ', strip=True) for c in cells]
-        joined = ' '.join(cell_texts)
-        matched = next((display for alias, display in aliases.items() if alias in normalize(joined)), None)
-        if not matched:
-            continue
-        date = next((d for d in (parse_date(x) for x in cell_texts) if d), None)
-        candidates = []
-        for text in cell_texts:
-            clean = text.replace(',', '').strip()
-            if parse_date(clean):
-                continue
-            if re.fullmatch(r'\d+(?:\.\d{3,8})', clean):
-                value = float(clean)
-                if 0 < value < 1000:
-                    candidates.append(value)
-        if date and candidates:
-            found[matched] = {'name': matched, 'nav': candidates[-1], 'date': date, 'source': 'Halogen Capital'}
-
-    # Second pass: embedded text/JSON-like page content. Require both an exact
-    # fund name and a nearby dated decimal NAV to avoid false matches.
-    if len(found) < len(HALOGEN_MAPPING):
-        text = soup.get_text(' ', strip=True)
-        for display, names in HALOGEN_MAPPING.items():
-            if display in found:
-                continue
-            for alias in names:
-                pos = normalize(text).find(normalize(alias))
-                if pos < 0:
-                    continue
-                fragment = text[max(0, pos - 120):pos + 500]
-                dates = re.findall(r'\b(?:\d{1,2}/\d{1,2}/\d{4}|\d{1,2}[-.]\d{1,2}[-.]\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})\b', fragment)
-                numbers = re.findall(r'(?<![\d.])(\d+\.\d{3,8})(?![\d.])', fragment)
-                parsed_dates = [parse_date(d) for d in dates]
-                parsed_dates = [d for d in parsed_dates if d]
-                values = [float(n) for n in numbers if 0 < float(n) < 1000]
-                if parsed_dates and values:
-                    found[display] = {'name': display, 'nav': values[-1], 'date': parsed_dates[0], 'source': 'Halogen Capital'}
-                    break
-    return found
-
-
-
-def extract_kenwealth_halogen(html):
-    """Extract the two Halogen NAVs from Kenanga's published Kenwealth table."""
-    soup = BeautifulSoup(html, 'html.parser')
-    aliases = {normalize(alias): display for display, names in HALOGEN_MAPPING.items() for alias in names}
+    aliases = {
+        normalize('HALOGEN SHARIAH CRYPTO TITANS FUND'): 'Halogen Shariah Crypto Titans Fund',
+        normalize('HALOGEN SHARIAH ETHERIUM FUND'): 'Halogen Shariah Ethereum Fund',
+        normalize('HALOGEN SHARIAH ETHEREUM FUND'): 'Halogen Shariah Ethereum Fund',
+    }
     found = {}
     for row in soup.select('tr'):
         cells = row.find_all(['td', 'th'], recursive=False)
         if len(cells) < 4:
             continue
-        values = [cell.get_text(' ', strip=True) for cell in cells]
-        fund_name = normalize(values[1])
-        display = aliases.get(fund_name)
+        values = [c.get_text(' ', strip=True) for c in cells]
+        fund_text = normalize(values[1])
+        display = aliases.get(fund_text)
         if not display:
             continue
         nav_text = values[2].replace(',', '').strip()
@@ -157,6 +103,26 @@ def extract_kenwealth_halogen(html):
         }
     return found
 
+
+def fetch_kenwealth_prices():
+    """Try the known Halogen page first, then discover the current page if it moved.
+
+    Kenwealth paginates the Unit Trust table. The Halogen rows were found on
+    page 19 in the verified page layout. If pagination changes, scan the
+    remaining pages and stop as soon as both exact funds are found.
+    """
+    expected = set(HALOGEN_MAPPING)
+    pages_to_try = [KENWEALTH_PAGE_HINT] + [p for p in range(1, 54) if p != KENWEALTH_PAGE_HINT]
+    all_found = {}
+    for page in pages_to_try:
+        url = KENWEALTH_BASE if page == 1 else f'{KENWEALTH_BASE}page/{page}/'
+        response = requests.get(url, timeout=15, headers=HEADERS)
+        response.raise_for_status()
+        page_found = extract_kenwealth_page(response.text)
+        all_found.update(page_found)
+        if expected.issubset(all_found):
+            break
+    return all_found
 
 def fetch_source(url):
     response = requests.get(url, timeout=25, headers=HEADERS)
@@ -186,37 +152,20 @@ def refresh_nav():
         source_status['Kenanga Investors'] = {'matched': 0, 'expected': len(KENANGA_MAPPING)}
         errors.append('Kenanga source: ' + str(exc)[:180])
 
-    halogen_prices = {}
-    halogen_error = None
     try:
-        halogen_prices = extract_halogen(fetch_source(HALOGEN_SOURCE))
+        halogen_prices = fetch_kenwealth_prices()
+        prices.update(halogen_prices)
+        source_status['Kenwealth'] = {'matched': len(halogen_prices), 'expected': len(HALOGEN_MAPPING)}
+        if len(halogen_prices) < len(HALOGEN_MAPPING):
+            missing_halogen = [name for name in HALOGEN_MAPPING if name not in halogen_prices]
+            errors.append('Kenwealth did not return dated NAV rows for: ' + ', '.join(missing_halogen))
     except Exception as exc:
-        halogen_error = str(exc)[:180]
-
-    # Kenwealth is the fallback source for Halogen funds. Only dated NAV rows
-    # with exact fund names are accepted; no stale hard-coded values are used.
-    if len(halogen_prices) < len(HALOGEN_MAPPING):
-        try:
-            kenwealth_prices = extract_kenwealth_halogen(fetch_source(KENWEALTH_SOURCE))
-            for fund_name, record in kenwealth_prices.items():
-                current = halogen_prices.get(fund_name)
-                if current is None or record['date'] > current['date']:
-                    halogen_prices[fund_name] = record
-        except Exception as exc:
-            errors.append('Kenwealth source: ' + str(exc)[:180])
-
-    prices.update(halogen_prices)
-    source_status['Halogen / Kenwealth'] = {
-        'matched': len(halogen_prices), 'expected': len(HALOGEN_MAPPING)
-    }
-    if len(halogen_prices) < len(HALOGEN_MAPPING):
-        missing_halogen = [name for name in HALOGEN_MAPPING if name not in halogen_prices]
-        detail = ('Halogen source: ' + halogen_error + '; ') if halogen_error else ''
-        errors.append(detail + 'No dated NAV found for: ' + ', '.join(missing_halogen))
+        source_status['Kenwealth'] = {'matched': 0, 'expected': len(HALOGEN_MAPPING)}
+        errors.append('Kenwealth source: ' + str(exc)[:180])
 
     missing = [name for name in ALL_FUNDS if name not in prices]
     payload = {
-        'source': {'Kenanga Investors': KENANGA_SOURCE, 'Halogen Capital': HALOGEN_SOURCE, 'Kenwealth': KENWEALTH_SOURCE},
+        'source': {'Kenanga Investors': KENANGA_SOURCE, 'Kenwealth': KENWEALTH_BASE},
         'sources': source_status,
         'fetched_at': datetime.now(timezone.utc).isoformat(),
         'funds': list(prices.values()),
