@@ -8,6 +8,7 @@ import requests
 app = Flask(__name__)
 KENANGA_SOURCE = 'https://www.kenangainvestors.com.my/fund-list'
 HALOGEN_SOURCE = 'https://www.halogen.my/fund/price'
+KENWEALTH_SOURCE = 'https://www.kenanga.com.my/ms/platform-dalam-talian/kenwealth/pricing-rates/unit-trusts/page/19/'
 
 # Exact names prevent mixing similarly named funds or share classes.
 KENANGA_MAPPING = {
@@ -128,6 +129,35 @@ def extract_halogen(html):
     return found
 
 
+
+def extract_kenwealth_halogen(html):
+    """Extract the two Halogen NAVs from Kenanga's published Kenwealth table."""
+    soup = BeautifulSoup(html, 'html.parser')
+    aliases = {normalize(alias): display for display, names in HALOGEN_MAPPING.items() for alias in names}
+    found = {}
+    for row in soup.select('tr'):
+        cells = row.find_all(['td', 'th'], recursive=False)
+        if len(cells) < 4:
+            continue
+        values = [cell.get_text(' ', strip=True) for cell in cells]
+        fund_name = normalize(values[1])
+        display = aliases.get(fund_name)
+        if not display:
+            continue
+        nav_text = values[2].replace(',', '').strip()
+        date = parse_date(values[3])
+        if not date or not re.fullmatch(r'\d+(?:\.\d{3,8})', nav_text):
+            continue
+        nav = float(nav_text)
+        if nav <= 0:
+            continue
+        found[display] = {
+            'name': display, 'nav': nav, 'date': date,
+            'source': 'Kenwealth (Kenanga)'
+        }
+    return found
+
+
 def fetch_source(url):
     response = requests.get(url, timeout=25, headers=HEADERS)
     response.raise_for_status()
@@ -156,20 +186,37 @@ def refresh_nav():
         source_status['Kenanga Investors'] = {'matched': 0, 'expected': len(KENANGA_MAPPING)}
         errors.append('Kenanga source: ' + str(exc)[:180])
 
+    halogen_prices = {}
+    halogen_error = None
     try:
         halogen_prices = extract_halogen(fetch_source(HALOGEN_SOURCE))
-        prices.update(halogen_prices)
-        source_status['Halogen Capital'] = {'matched': len(halogen_prices), 'expected': len(HALOGEN_MAPPING)}
-        if len(halogen_prices) < len(HALOGEN_MAPPING):
-            missing_halogen = [name for name in HALOGEN_MAPPING if name not in halogen_prices]
-            errors.append('Halogen source did not expose a dated NAV for: ' + ', '.join(missing_halogen))
     except Exception as exc:
-        source_status['Halogen Capital'] = {'matched': 0, 'expected': len(HALOGEN_MAPPING)}
-        errors.append('Halogen source: ' + str(exc)[:180])
+        halogen_error = str(exc)[:180]
+
+    # Kenwealth is the fallback source for Halogen funds. Only dated NAV rows
+    # with exact fund names are accepted; no stale hard-coded values are used.
+    if len(halogen_prices) < len(HALOGEN_MAPPING):
+        try:
+            kenwealth_prices = extract_kenwealth_halogen(fetch_source(KENWEALTH_SOURCE))
+            for fund_name, record in kenwealth_prices.items():
+                current = halogen_prices.get(fund_name)
+                if current is None or record['date'] > current['date']:
+                    halogen_prices[fund_name] = record
+        except Exception as exc:
+            errors.append('Kenwealth source: ' + str(exc)[:180])
+
+    prices.update(halogen_prices)
+    source_status['Halogen / Kenwealth'] = {
+        'matched': len(halogen_prices), 'expected': len(HALOGEN_MAPPING)
+    }
+    if len(halogen_prices) < len(HALOGEN_MAPPING):
+        missing_halogen = [name for name in HALOGEN_MAPPING if name not in halogen_prices]
+        detail = ('Halogen source: ' + halogen_error + '; ') if halogen_error else ''
+        errors.append(detail + 'No dated NAV found for: ' + ', '.join(missing_halogen))
 
     missing = [name for name in ALL_FUNDS if name not in prices]
     payload = {
-        'source': {'Kenanga Investors': KENANGA_SOURCE, 'Halogen Capital': HALOGEN_SOURCE},
+        'source': {'Kenanga Investors': KENANGA_SOURCE, 'Halogen Capital': HALOGEN_SOURCE, 'Kenwealth': KENWEALTH_SOURCE},
         'sources': source_status,
         'fetched_at': datetime.now(timezone.utc).isoformat(),
         'funds': list(prices.values()),
