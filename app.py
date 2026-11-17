@@ -159,17 +159,18 @@ def _record_from_mapping(display, date_value, nav_value, source):
 
 
 def extract_halogen(html):
-    """Parse dated NAVs exposed in Halogen's official price page HTML.
+    """Parse dated NAV rows from Halogen's official price page.
 
-    The official page can render its price selector/data dynamically. We parse
-    visible tables and embedded JSON only; if no dated price is exposed, return
-    no match rather than guessing from a nearby number or a fact sheet.
+    First parse ordinary HTML/embedded state. If the page is client-rendered,
+    parse the Markdown representation returned by Jina Reader for the same
+    official Halogen URL. Only exact fund-name + currency + NAV + date rows
+    are accepted; the newest dated row wins.
     """
     soup = BeautifulSoup(html, "html.parser")
     aliases = {norm(alias): name for name, values in HALOGEN_MAPPING.items() for alias in values}
     results = {}
 
-    # Standard HTML table rows, using explicit column names where available.
+    # Standard HTML table rows.
     for table in soup.find_all("table"):
         headers = _table_headers(table)
         date_idx = next((i for i, h in enumerate(headers) if "date" in h), None)
@@ -180,29 +181,23 @@ def extract_halogen(html):
             if not texts:
                 continue
             display = next((aliases[norm(t)] for t in texts if norm(t) in aliases), None)
-            if not display:
-                continue
-            if date_idx is not None and nav_idx is not None and max(date_idx, nav_idx) < len(texts):
+            if display and date_idx is not None and nav_idx is not None and max(date_idx, nav_idx) < len(texts):
                 record = _record_from_mapping(display, texts[date_idx], texts[nav_idx], "Halogen Capital")
-                if record:
+                if record and (display not in results or record["date"] > results[display]["date"]):
                     results[display] = record
 
-    # Embedded JSON / application state. Require fund name, explicit NAV key,
-    # and explicit date key in the same object.
+    # Embedded JSON / application state.
     for script in soup.find_all("script"):
         raw = script.string or script.get_text() or ""
         if not raw or not any(alias in raw.casefold() for alias in aliases):
             continue
-        candidates = []
         for match in re.finditer(r"\{[^{}]{0,3000}\}", raw, re.S):
-            snippet = match.group(0)
             try:
-                obj = json.loads(snippet)
+                obj = json.loads(match.group(0))
             except Exception:
                 continue
-            if isinstance(obj, dict):
-                candidates.append(obj)
-        for obj in candidates:
+            if not isinstance(obj, dict):
+                continue
             flat = {norm(k): v for k, v in obj.items()}
             fund_value = next((v for k, v in flat.items() if k in {"fund", "fund name", "name", "productname"}), None)
             display = aliases.get(norm(fund_value)) if fund_value is not None else None
@@ -211,9 +206,31 @@ def extract_halogen(html):
             date_value = next((v for k, v in flat.items() if "date" in k), None)
             nav_value = next((v for k, v in flat.items() if k in {"nav", "price", "nav price", "nav per unit", "unit price"}), None)
             record = _record_from_mapping(display, date_value, nav_value, "Halogen Capital")
-            if record:
+            if record and (display not in results or record["date"] > results[display]["date"]):
                 results[display] = record
 
+    return results
+
+
+def extract_halogen_reader(markdown):
+    """Extract exact fund NAV rows from Jina Reader's rendering of Halogen's page."""
+    aliases = {norm(alias): name for name, values in HALOGEN_MAPPING.items() for alias in values}
+    results = {}
+    # Reader output includes rows like: [Fund name](official-fund-url)RM 0.5462 16 Nov 2026
+    pattern = re.compile(
+        r"\[([^\]]+)\]\(https?://(?:www\.)?halogen\.my/fund/[^)]+\)\s*"
+        r"(?:RM|MYR)\s*([0-9]+(?:\.[0-9]{3,8}))\s+"
+        r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
+        re.I,
+    )
+    for match in pattern.finditer(markdown or ""):
+        fund_label = re.sub(r"\s*-\s*Class\s+MYR\s*$", "", match.group(1), flags=re.I)
+        display = aliases.get(norm(fund_label))
+        if not display:
+            continue
+        record = _record_from_mapping(display, match.group(3), match.group(2), "Halogen Capital (official page via Reader)")
+        if record and (display not in results or record["date"] > results[display]["date"]):
+            results[display] = record
     return results
 
 
@@ -232,10 +249,25 @@ def refresh_payload():
 
     try:
         halogen = extract_halogen(request_html(HALOGEN_SOURCE))
-        prices.update(halogen)
-        statuses["Halogen Capital"] = {"matched": len(halogen), "expected": len(HALOGEN_MAPPING)}
+        halogen_method = "official HTML"
         if len(halogen) < len(HALOGEN_MAPPING):
-            errors.append("Halogen official page did not expose all dated NAV rows in its server-rendered HTML. The page may load prices dynamically; no guessed price was used.")
+            # Fallback is a reader rendering of the same official Halogen page,
+            # not KenWealth and not a manually entered price.
+            reader_url = "https://r.jina.ai/http://www.halogen.my/fund/price/"
+            reader_rows = extract_halogen_reader(request_html(reader_url))
+            for name, record in reader_rows.items():
+                if name not in halogen or record["date"] > halogen[name]["date"]:
+                    halogen[name] = record
+            if reader_rows:
+                halogen_method = "official page via Jina Reader"
+        prices.update(halogen)
+        statuses["Halogen Capital"] = {
+            "matched": len(halogen),
+            "expected": len(HALOGEN_MAPPING),
+            "method": halogen_method,
+        }
+        if len(halogen) < len(HALOGEN_MAPPING):
+            errors.append("Halogen official page: only " + str(len(halogen)) + " of 2 NAV rows could be read; no guessed price was used.")
     except Exception as exc:
         statuses["Halogen Capital"] = {"matched": 0, "expected": len(HALOGEN_MAPPING)}
         errors.append("Halogen source: " + str(exc)[:250])
