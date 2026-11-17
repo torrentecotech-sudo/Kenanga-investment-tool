@@ -122,9 +122,14 @@ def fetch_kenwealth_prices():
             response.raise_for_status()
             page_found = extract_kenwealth_page(response.text)
             all_found.update(page_found)
-        except requests.RequestException as exc:
-            # A missing/blocked pagination page must not stop the remaining scan.
-            page_errors.append(f'page {page}: {exc.__class__.__name__}')
+                except requests.RequestException as exc:
+            response = getattr(exc, 'response', None)
+            status = response.status_code if response is not None else 'No HTTP response'
+            detail = response.text[:200] if response is not None else str(exc)
+            page_errors.append(
+                f'page {page}: HTTP {status} - {detail}'
+            )
+            continue
             continue
         if expected.issubset(all_found):
             break
