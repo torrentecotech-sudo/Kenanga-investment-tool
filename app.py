@@ -309,8 +309,10 @@ def _extract_fund_id_candidates(html):
             if value.isdigit() and name in {"id", "fund id", "fund_id", "fundid"}:
                 found.add(int(value))
     patterns = [
-        r"(?:fund[_-]?id|fundId|fundid|data-fund-id)\\D{0,12}(\\d+)",
-        r"data-id\\D{0,12}(\\d+)",
+        r"(?:fund[_-]?id|fundId|fundid|data-fund-id)\D{0,12}(\d+)",
+        r"data-id\D{0,12}(\d+)",
+        r"(?:^|[\"'\s,{])id[\"']?\s*[:=]\s*[\"']?(\d+)",
+        r"(?:fund|product)[_-]?id[\"']?\s*[:=]\s*[\"']?(\d+)",
     ]
     for pattern in patterns:
         for match in re.finditer(pattern, html, re.I):
@@ -344,8 +346,29 @@ def fetch_kenanga_nav_history_candidate(fund_name, fund_id):
     )
 
 
+def _kenanga_profile_url(href, fund_name):
+    """Resolve the fund-list disclaimer redirect to the actual public fund profile."""
+    from urllib.parse import urlparse, parse_qs
+
+    absolute = requests.compat.urljoin(KENANGA_SOURCE, href)
+    parsed = urlparse(absolute)
+    if parsed.path.rstrip("/").endswith("fund-disclaimer"):
+        slug = parse_qs(parsed.query).get("link", [""])[0].strip()
+        # Most disclaimer links contain the profile slug. A few use internal
+        # short codes, so use the known public profile slug for those funds.
+        code_slugs = {
+            "KIAPTRF": "kenanga-islamic-asia-pacific-ex-japan-total-return-fund",
+            "KASGRAF": "kenanga-alternative-series-global-real-assets-fund",
+        }
+        if slug in code_slugs:
+            slug = code_slugs[slug]
+        if slug:
+            return f"https://www.kenangainvestors.com.my/{slug}"
+    return absolute
+
+
 def discover_kenanga_fund_ids():
-    """Find official fund detail links, extract candidate IDs, and validate before adding them."""
+    """Find official fund profiles, extract candidate IDs, and validate before adding them."""
     soup = BeautifulSoup(request_html(KENANGA_SOURCE), "html.parser")
     aliases = {norm(alias): name for name, values in KENANGA_MAPPING.items() for alias in values}
     links = {}
@@ -353,8 +376,7 @@ def discover_kenanga_fund_ids():
         label = norm(anchor.get_text(" ", strip=True))
         fund_name = aliases.get(label)
         if fund_name:
-            href = anchor["href"].strip()
-            links[fund_name] = href if href.startswith("http") else requests.compat.urljoin(KENANGA_SOURCE, href)
+            links[fund_name] = _kenanga_profile_url(anchor["href"].strip(), fund_name)
 
     results = []
     for fund_name in KENANGA_MAPPING:
