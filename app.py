@@ -29,6 +29,8 @@ KENANGA_MAPPING = {
     "Kenanga Islamic Asia Pacific (ex Japan) Total Return Fund": ["Kenanga Islamic Asia Pacific (ex Japan) Total Return Fund"],
     "Kenanga Global Islamic Fund": ["Kenanga Global Islamic Fund"],
     "Kenanga ASnitaBOND Fund": ["Kenanga ASnitaBOND Fund"],
+    "Kenanga Alternative Series: Global Real Assets Fund": ["Kenanga Alternative Series: Global Real Assets Fund", "Kenanga Alternative Series Global Real Assets Fund"],
+    "Kenanga Shariah US Titans 50 Fund": ["Kenanga Shariah US Titans 50 Fund", "Kenanga Shariah US Titan 50 Fund"],
 }
 
 HALOGEN_MAPPING = {
@@ -291,6 +293,106 @@ def fetch_kenanga_nav_history(fund_name, from_date, end_date, page_size=100):
             "end_date": end_date, "records_total": total or 0, "records_returned": len(all_rows),
             "source_url": KENANGA_NAV_HISTORY_URL, "data": all_rows}
 
+
+def _extract_fund_id_candidates(html):
+    """Extract possible numeric IDs from official detail-page markup."""
+    soup = BeautifulSoup(html, "html.parser")
+    found = set()
+    for tag in soup.find_all(True):
+        for attr in ("data-fund-id", "data-id", "data-fundid"):
+            value = str(tag.get(attr) or "").strip()
+            if value.isdigit():
+                found.add(int(value))
+        if tag.name == "input":
+            name = norm(tag.get("name") or tag.get("id"))
+            value = str(tag.get("value") or "").strip()
+            if value.isdigit() and name in {"id", "fund id", "fund_id", "fundid"}:
+                found.add(int(value))
+    patterns = [
+        r"(?:fund[_-]?id|fundId|fundid|data-fund-id)\\D{0,12}(\\d+)",
+        r"data-id\\D{0,12}(\\d+)",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, html, re.I):
+            found.add(int(match.group(1)))
+    return sorted(found)
+
+
+def fetch_kenanga_nav_history_candidate(fund_name, fund_id):
+    """Validate a candidate ID with a small official historical-NAV request."""
+    session = requests.Session()
+    headers = {
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Origin": "https://www.kenangainvestors.com.my",
+        "Referer": "https://www.kenangainvestors.com.my/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    session.get("https://www.kenangainvestors.com.my/", headers=HEADERS, timeout=20)
+    form = _history_form_payload(fund_id, "01-01-2000", datetime.now().strftime("%d-%m-%Y"), 1, 0, 2)
+    response = session.post(KENANGA_NAV_HISTORY_URL, data=form, headers=headers, timeout=25)
+    response.raise_for_status()
+    body = response.json()
+    rows = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return False
+    return any(
+        isinstance(row, (list, tuple)) and len(row) >= 4
+        and parse_date(row[0]) and parse_price(row[2]) is not None
+        for row in rows
+    )
+
+
+def discover_kenanga_fund_ids():
+    """Find official fund detail links, extract candidate IDs, and validate before adding them."""
+    soup = BeautifulSoup(request_html(KENANGA_SOURCE), "html.parser")
+    aliases = {norm(alias): name for name, values in KENANGA_MAPPING.items() for alias in values}
+    links = {}
+    for anchor in soup.find_all("a", href=True):
+        label = norm(anchor.get_text(" ", strip=True))
+        fund_name = aliases.get(label)
+        if fund_name:
+            href = anchor["href"].strip()
+            links[fund_name] = href if href.startswith("http") else requests.compat.urljoin(KENANGA_SOURCE, href)
+
+    results = []
+    for fund_name in KENANGA_MAPPING:
+        if fund_name in KENANGA_FUND_IDS:
+            results.append({"fund": fund_name, "fund_id": KENANGA_FUND_IDS[fund_name], "status": "verified"})
+            continue
+        page_url = links.get(fund_name)
+        if not page_url:
+            results.append({"fund": fund_name, "fund_id": None, "status": "not_found", "detail": "No exact matching detail link found on official fund list"})
+            continue
+        try:
+            html = request_html(page_url)
+            page_text = norm(BeautifulSoup(html, "html.parser").get_text(" ", strip=True))
+            if not any(norm(alias) in page_text for alias in KENANGA_MAPPING[fund_name]):
+                results.append({"fund": fund_name, "fund_id": None, "status": "name_not_confirmed", "page": page_url})
+                continue
+            candidates = _extract_fund_id_candidates(html)
+            verified_id = None
+            for candidate in candidates:
+                if fetch_kenanga_nav_history_candidate(fund_name, candidate):
+                    verified_id = candidate
+                    break
+            if verified_id is not None:
+                KENANGA_FUND_IDS[fund_name] = verified_id
+                results.append({"fund": fund_name, "fund_id": verified_id, "status": "verified", "page": page_url})
+            else:
+                results.append({"fund": fund_name, "fund_id": None, "status": "needs_manual_review", "candidates_checked": candidates, "page": page_url})
+        except Exception as exc:
+            results.append({"fund": fund_name, "fund_id": None, "status": "error", "detail": str(exc)[:180], "page": page_url})
+    return {
+        "source": KENANGA_SOURCE,
+        "verified": sum(1 for item in results if item["status"] == "verified"),
+        "total": len(KENANGA_MAPPING),
+        "funds": results,
+        "note": "Only IDs extracted from matching official fund pages and validated against the historical NAV endpoint are accepted."
+    }
+
+
 def refresh_payload():
     prices, errors, statuses = {}, [], {}
     try:
@@ -359,6 +461,23 @@ def api_nav():
     status = 200 if payload["matched"] else 502
     return jsonify(payload), status
 
+
+
+@app.get("/api/nav/fund-ids/discover")
+def api_discover_fund_ids():
+    try:
+        return jsonify(discover_kenanga_fund_ids())
+    except Exception as exc:
+        return jsonify({"error": str(exc)[:250]}), 502
+
+
+@app.get("/api/nav/fund-ids")
+def api_list_fund_ids():
+    return jsonify({
+        "verified": [{"fund": name, "fund_id": fund_id} for name, fund_id in KENANGA_FUND_IDS.items()],
+        "pending": [name for name in KENANGA_MAPPING if name not in KENANGA_FUND_IDS],
+        "note": "Only verified IDs are listed. Discovery is best-effort and never guesses IDs."
+    })
 
 @app.get("/api/nav/history")
 def api_nav_history():
