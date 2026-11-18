@@ -5,11 +5,15 @@ import re
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
+
 KENANGA_SOURCE = "https://www.kenangainvestors.com.my/fund-list"
 HALOGEN_SOURCE = "https://www.halogen.my/fund/price/"
+# KenWealth's public unit-trust pricing table includes Halogen Capital funds.
+# This is a clearly labelled fallback, not represented as Halogen's own website.
+HALOGEN_FALLBACK_SOURCE = "https://www.kenanga.com.my/ms/platform-dalam-talian/kenwealth/pricing-rates/unit-trusts/page/19/"
 
 KENANGA_MAPPING = {
     "Kenanga Growth Fund": ["Kenanga Growth Fund"],
@@ -26,11 +30,13 @@ KENANGA_MAPPING = {
     "Kenanga Global Islamic Fund": ["Kenanga Global Islamic Fund"],
     "Kenanga ASnitaBOND Fund": ["Kenanga ASnitaBOND Fund"],
 }
+
 HALOGEN_MAPPING = {
     "Halogen Shariah Crypto Titans Fund": ["Halogen Shariah Crypto Titans Fund", "HALOGEN SHARIAH CRYPTO TITANS FUND"],
     "Halogen Shariah Ethereum Fund": ["Halogen Shariah Ethereum Fund", "HALOGEN SHARIAH ETHERIUM FUND"],
 }
 ALL_FUNDS = list(KENANGA_MAPPING) + list(HALOGEN_MAPPING)
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -63,7 +69,6 @@ def parse_price(value):
         number = float(raw)
     except ValueError:
         return None
-    # A broad sanity range; still allows small NAV values while rejecting zero.
     return number if 0.001 <= number <= 100 else None
 
 
@@ -91,102 +96,55 @@ def _table_headers(table):
 
 
 def extract_kenanga(html):
-    """Read Kenanga Fund Name + NAV Date + NAV Price columns by header labels.
-
-    Kenanga's page also has NAV Change. This parser deliberately never reads
-    that column as a fallback price.
-    """
+    """Read Kenanga Investors Fund Name + NAV Date + NAV Price columns."""
     soup = BeautifulSoup(html, "html.parser")
     aliases = {norm(alias): name for name, values in KENANGA_MAPPING.items() for alias in values}
     results = {}
-
     for table in soup.find_all("table"):
         headers = _table_headers(table)
         fund_idx = next((i for i, h in enumerate(headers) if "fund name" in h or h == "fund"), None)
         date_idx = next((i for i, h in enumerate(headers) if "nav date" in h or h == "date"), None)
         price_idx = next((i for i, h in enumerate(headers) if "nav price" in h or h == "nav"), None)
-
         for row in table.find_all("tr"):
             cells = row.find_all(["td", "th"], recursive=False)
             if not cells:
                 continue
             texts = [cell.get_text(" ", strip=True) for cell in cells]
-
-            # First locate an exact selected fund name in any cell.
-            matched = None
-            matched_idx = None
-            for idx, text in enumerate(texts):
-                key = norm(text)
-                if key in aliases:
-                    matched, matched_idx = aliases[key], idx
-                    break
+            matched = next((aliases[norm(t)] for t in texts if norm(t) in aliases), None)
             if not matched:
                 continue
-
-            date = None
-            nav = None
-            if fund_idx is not None and date_idx is not None and price_idx is not None:
-                # Header indexes are authoritative; account for cells that align with the table.
-                if max(fund_idx, date_idx, price_idx) < len(texts):
-                    date = parse_date(texts[date_idx])
-                    nav = parse_price(texts[price_idx])
-
-            # Strict structural fallback for markup that omits usable headers:
-            # immediately after the exact fund-name cell expect NAV Date then NAV Price.
-            if date is None or nav is None:
-                if matched_idx + 2 < len(texts):
-                    candidate_date = parse_date(texts[matched_idx + 1])
-                    candidate_nav = parse_price(texts[matched_idx + 2])
-                    if candidate_date and candidate_nav:
-                        date, nav = candidate_date, candidate_nav
-
+            if fund_idx is not None and date_idx is not None and price_idx is not None and max(fund_idx, date_idx, price_idx) < len(texts):
+                date, nav = parse_date(texts[date_idx]), parse_price(texts[price_idx])
+            else:
+                date = nav = None
             if date and nav:
-                results[matched] = {
-                    "name": matched,
-                    "nav": nav,
-                    "date": date,
-                    "source": "Kenanga Investors",
-                }
+                results[matched] = {"name": matched, "nav": nav, "date": date, "source": "Kenanga Investors"}
     return results
 
 
 def _record_from_mapping(display, date_value, nav_value, source):
-    date = parse_date(date_value)
-    nav = parse_price(nav_value)
+    date, nav = parse_date(date_value), parse_price(nav_value)
     if date and nav:
         return {"name": display, "nav": nav, "date": date, "source": source}
     return None
 
 
 def extract_halogen(html):
-    """Parse dated NAV rows from Halogen's official price page.
-
-    First parse ordinary HTML/embedded state. If the page is client-rendered,
-    parse the Markdown representation returned by Jina Reader for the same
-    official Halogen URL. Only exact fund-name + currency + NAV + date rows
-    are accepted; the newest dated row wins.
-    """
+    """Parse dated NAVs exposed in Halogen Capital's own price page HTML/JSON."""
     soup = BeautifulSoup(html, "html.parser")
     aliases = {norm(alias): name for name, values in HALOGEN_MAPPING.items() for alias in values}
     results = {}
-
-    # Standard HTML table rows.
     for table in soup.find_all("table"):
         headers = _table_headers(table)
         date_idx = next((i for i, h in enumerate(headers) if "date" in h), None)
         nav_idx = next((i for i, h in enumerate(headers) if "nav" in h or "price" in h), None)
         for row in table.find_all("tr"):
-            cells = row.find_all(["td", "th"], recursive=False)
-            texts = [c.get_text(" ", strip=True) for c in cells]
-            if not texts:
-                continue
+            texts = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"], recursive=False)]
             display = next((aliases[norm(t)] for t in texts if norm(t) in aliases), None)
             if display and date_idx is not None and nav_idx is not None and max(date_idx, nav_idx) < len(texts):
                 record = _record_from_mapping(display, texts[date_idx], texts[nav_idx], "Halogen Capital")
-                if record and (display not in results or record["date"] > results[display]["date"]):
+                if record:
                     results[display] = record
-
-    # Embedded JSON / application state.
     for script in soup.find_all("script"):
         raw = script.string or script.get_text() or ""
         if not raw or not any(alias in raw.casefold() for alias in aliases):
@@ -206,37 +164,135 @@ def extract_halogen(html):
             date_value = next((v for k, v in flat.items() if "date" in k), None)
             nav_value = next((v for k, v in flat.items() if k in {"nav", "price", "nav price", "nav per unit", "unit price"}), None)
             record = _record_from_mapping(display, date_value, nav_value, "Halogen Capital")
-            if record and (display not in results or record["date"] > results[display]["date"]):
+            if record:
                 results[display] = record
-
     return results
 
 
-def extract_halogen_reader(markdown):
-    """Extract exact fund NAV rows from Jina Reader's rendering of Halogen's page."""
+def extract_halogen_kenwealth_fallback(html):
+    """Read exact Halogen fund rows from KenWealth's published unit-trust price table."""
+    soup = BeautifulSoup(html, "html.parser")
     aliases = {norm(alias): name for name, values in HALOGEN_MAPPING.items() for alias in values}
     results = {}
-    # Reader output includes rows like: [Fund name](official-fund-url)RM 0.5462 16 Nov 2026
-    pattern = re.compile(
-        r"\[([^\]]+)\]\(https?://(?:www\.)?halogen\.my/fund/[^)]+\)\s*"
-        r"(?:RM|MYR)\s*([0-9]+(?:\.[0-9]{3,8}))\s+"
-        r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
-        re.I,
-    )
-    for match in pattern.finditer(markdown or ""):
-        fund_label = re.sub(r"\s*-\s*Class\s+MYR\s*$", "", match.group(1), flags=re.I)
-        display = aliases.get(norm(fund_label))
-        if not display:
+    for table in soup.find_all("table"):
+        headers = []
+        for row in table.find_all("tr")[:3]:
+            cells = row.find_all(["th", "td"], recursive=False)
+            labels = [norm(cell.get_text(" ", strip=True)) for cell in cells]
+            if "fund" in labels and "nav" in labels and "date" in labels:
+                headers = labels
+                break
+        if not headers:
             continue
-        record = _record_from_mapping(display, match.group(3), match.group(2), "Halogen Capital (official page via Reader)")
-        if record and (display not in results or record["date"] > results[display]["date"]):
-            results[display] = record
+        fund_idx = headers.index("fund")
+        nav_idx = headers.index("nav")
+        date_idx = headers.index("date")
+        provider_idx = headers.index("provider") if "provider" in headers else None
+        for row in table.find_all("tr"):
+            texts = [cell.get_text(" ", strip=True) for cell in row.find_all(["td", "th"], recursive=False)]
+            if max(fund_idx, nav_idx, date_idx) >= len(texts):
+                continue
+            display = aliases.get(norm(texts[fund_idx]))
+            if not display:
+                continue
+            if provider_idx is not None and (provider_idx >= len(texts) or "halogen" not in norm(texts[provider_idx])):
+                continue
+            record = _record_from_mapping(display, texts[date_idx], texts[nav_idx], "Kenanga KenWealth (Halogen fund listing)")
+            if record:
+                results[display] = record
     return results
 
+
+
+# Historical NAV endpoint discovered from Kenanga Investors browser Network capture.
+KENANGA_NAV_HISTORY_URL = "https://www.kenangainvestors.com.my/fund/fund/ajax-get-fund-nav-list"
+KENANGA_FUND_IDS = {"Kenanga Growth Fund": 49}
+
+
+def _history_form_payload(fund_id, from_date, end_date, draw, start, length):
+    """Build the DataTables form payload used by Kenanga's historical NAV table."""
+    payload = {
+        "draw": str(draw),
+        "start": str(start),
+        "length": str(length),
+        "search[value]": "",
+        "search[regex]": "false",
+        "id": str(fund_id),
+        "from_date": from_date,
+        "end_date": end_date,
+    }
+    for i in range(4):
+        payload.update({
+            f"columns[{i}][data]": str(i),
+            f"columns[{i}][name]": "",
+            f"columns[{i}][searchable]": "true",
+            f"columns[{i}][orderable]": "false",
+            f"columns[{i}][search][value]": "",
+            f"columns[{i}][search][regex]": "false",
+        })
+    return payload
+
+
+def fetch_kenanga_nav_history(fund_name, from_date, end_date, page_size=100):
+    """Fetch all historical NAV rows for a supported Kenanga fund. Dates: DD-MM-YYYY."""
+    fund_id = KENANGA_FUND_IDS.get(fund_name)
+    if fund_id is None:
+        raise ValueError(f"Historical fund ID not yet verified for {fund_name}")
+    for value, label in ((from_date, "from_date"), (end_date, "end_date")):
+        if not re.fullmatch(r"\d{2}-\d{2}-\d{4}", value or ""):
+            raise ValueError(f"{label} must use DD-MM-YYYY")
+    session = requests.Session()
+    headers = {
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Origin": "https://www.kenangainvestors.com.my",
+        "Referer": "https://www.kenangainvestors.com.my/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    # Establish first-party cookies without copying a user's browser cookie into the app.
+    session.get("https://www.kenangainvestors.com.my/", headers=HEADERS, timeout=25)
+    all_rows, start, draw, total = [], 0, 1, None
+    while total is None or start < total:
+        form = _history_form_payload(fund_id, from_date, end_date, draw, start, page_size)
+        response = session.post(KENANGA_NAV_HISTORY_URL, data=form, headers=headers, timeout=30)
+        response.raise_for_status()
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Kenanga historical NAV endpoint did not return JSON") from exc
+        if not isinstance(body, dict) or not isinstance(body.get("data"), list):
+            raise RuntimeError("Unexpected response structure from Kenanga historical NAV endpoint")
+        total = int(body.get("recordsFiltered", body.get("recordsTotal", len(body["data"]))))
+        rows = body["data"]
+        if not rows:
+            break
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 4:
+                continue
+            date_text, currency, nav_text, change_text = row[:4]
+            date_iso = parse_date(date_text)
+            nav = parse_price(nav_text)
+            if date_iso and nav is not None:
+                all_rows.append({
+                    "date": date_iso,
+                    "date_display": date_text,
+                    "currency": currency,
+                    "nav": nav,
+                    "change": change_text,
+                    "source": "Kenanga Investors",
+                    "fund": fund_name,
+                })
+        start += len(rows)
+        draw += 1
+        if len(rows) < page_size:
+            break
+    return {"fund": fund_name, "fund_id": fund_id, "from_date": from_date,
+            "end_date": end_date, "records_total": total or 0, "records_returned": len(all_rows),
+            "source_url": KENANGA_NAV_HISTORY_URL, "data": all_rows}
 
 def refresh_payload():
     prices, errors, statuses = {}, [], {}
-
     try:
         kenanga = extract_kenanga(request_html(KENANGA_SOURCE))
         prices.update(kenanga)
@@ -247,34 +303,39 @@ def refresh_payload():
         statuses["Kenanga Investors"] = {"matched": 0, "expected": len(KENANGA_MAPPING)}
         errors.append("Kenanga source: " + str(exc)[:250])
 
+    halogen_primary = {}
     try:
-        halogen = extract_halogen(request_html(HALOGEN_SOURCE))
-        halogen_method = "official HTML"
-        if len(halogen) < len(HALOGEN_MAPPING):
-            # Fallback is a reader rendering of the same official Halogen page,
-            # not KenWealth and not a manually entered price.
-            reader_url = "https://r.jina.ai/http://www.halogen.my/fund/price/"
-            reader_rows = extract_halogen_reader(request_html(reader_url))
-            for name, record in reader_rows.items():
-                if name not in halogen or record["date"] > halogen[name]["date"]:
-                    halogen[name] = record
-            if reader_rows:
-                halogen_method = "official page via Jina Reader"
-        prices.update(halogen)
-        statuses["Halogen Capital"] = {
-            "matched": len(halogen),
-            "expected": len(HALOGEN_MAPPING),
-            "method": halogen_method,
-        }
-        if len(halogen) < len(HALOGEN_MAPPING):
-            errors.append("Halogen official page: only " + str(len(halogen)) + " of 2 NAV rows could be read; no guessed price was used.")
+        halogen_primary = extract_halogen(request_html(HALOGEN_SOURCE))
+        prices.update(halogen_primary)
+        statuses["Halogen Capital"] = {"matched": len(halogen_primary), "expected": len(HALOGEN_MAPPING)}
     except Exception as exc:
         statuses["Halogen Capital"] = {"matched": 0, "expected": len(HALOGEN_MAPPING)}
         errors.append("Halogen source: " + str(exc)[:250])
 
+    halogen_missing = [name for name in HALOGEN_MAPPING if name not in prices]
+    if halogen_missing:
+        try:
+            fallback = extract_halogen_kenwealth_fallback(request_html(HALOGEN_FALLBACK_SOURCE))
+            for name, record in fallback.items():
+                if name not in prices:
+                    prices[name] = record
+            statuses["Kenanga KenWealth Halogen fallback"] = {
+                "matched": len(fallback), "expected": len(HALOGEN_MAPPING),
+                "used_for": [name for name in fallback if name not in halogen_primary],
+            }
+        except Exception as exc:
+            statuses["Kenanga KenWealth Halogen fallback"] = {"matched": 0, "expected": len(HALOGEN_MAPPING)}
+            errors.append("KenWealth Halogen fallback: " + str(exc)[:250])
+
     missing = [name for name in ALL_FUNDS if name not in prices]
+    if missing:
+        errors.append("No dated official/fallback NAV found for: " + ", ".join(missing))
     return {
-        "source": {"Kenanga Investors": KENANGA_SOURCE, "Halogen Capital": HALOGEN_SOURCE},
+        "source": {
+            "Kenanga Investors": KENANGA_SOURCE,
+            "Halogen Capital": HALOGEN_SOURCE,
+            "Kenanga KenWealth Halogen fallback": HALOGEN_FALLBACK_SOURCE,
+        },
         "sources": statuses,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "funds": list(prices.values()),
@@ -297,6 +358,22 @@ def api_nav():
     payload = refresh_payload()
     status = 200 if payload["matched"] else 502
     return jsonify(payload), status
+
+
+@app.get("/api/nav/history")
+def api_nav_history():
+    fund_name = request.args.get("fund", "Kenanga Growth Fund")
+    from_date = request.args.get("from_date", "")
+    end_date = request.args.get("end_date", "")
+    try:
+        result = fetch_kenanga_nav_history(fund_name, from_date, end_date)
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except requests.RequestException as exc:
+        return jsonify({"error": "Kenanga request failed: " + str(exc)[:200]}), 502
+    except Exception as exc:
+        return jsonify({"error": str(exc)[:250]}), 502
 
 
 @app.get("/health")
