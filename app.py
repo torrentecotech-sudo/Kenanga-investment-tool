@@ -363,10 +363,22 @@ def api_nav():
 @app.get("/api/nav/history")
 def api_nav_history():
     fund_name = request.args.get("fund", "Kenanga Growth Fund")
-    from_date = request.args.get("from_date", "")
-    end_date = request.args.get("end_date", "")
+    # HTML date inputs send YYYY-MM-DD; also accept DD-MM-YYYY.
+    from_value = request.args.get("from") or request.args.get("from_date", "")
+    to_value = request.args.get("to") or request.args.get("end_date", "")
+    def to_ddmmyyyy(value):
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value or ""):
+            return datetime.strptime(value, "%Y-%m-%d").strftime("%d-%m-%Y")
+        return value
+    from_date, end_date = to_ddmmyyyy(from_value), to_ddmmyyyy(to_value)
     try:
         result = fetch_kenanga_nav_history(fund_name, from_date, end_date)
+        # Chronological points for the performance chart.
+        result["points"] = [
+            {"date": row["date"], "nav": row["nav"], "source": row["source"]}
+            for row in sorted(result["data"], key=lambda item: item["date"])
+        ]
+        result["source_note"] = "Kenanga Investors · official historical NAV"
         return jsonify(result)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
