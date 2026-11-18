@@ -18,7 +18,7 @@ table{width:100%;border-collapse:collapse;background:#fff;font-size:13px}th,td{t
 </style></head>
 <body>
 <header><div class="headrow"><div><div class="brand">KENANGA • ADVISER TOOL</div><h1>Investment Dashboard</h1><div class="sub">Fund Price List & Cost Averaging Calculator</div></div><span class="pill" style="background:#ffffff20;color:#fff">MYR · Malaysia</span></div>
-<nav><button class="tab active" data-tab="prices">Fund Price List</button><button class="tab" data-tab="calc">Cost Averaging</button></nav></header>
+<nav><button class="tab active" data-tab="prices">Fund Price List</button><button class="tab" data-tab="performance">NAV Performance</button><button class="tab" data-tab="calc">Cost Averaging</button></nav></header>
 <main>
 <section id="prices" class="panel active">
 <div class="grid">
@@ -33,6 +33,32 @@ table{width:100%;border-collapse:collapse;background:#fff;font-size:13px}th,td{t
 <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap"><button class="btn" id="saveNav">Save NAV</button><label class="btn secondary" style="cursor:pointer">Import CSV <input id="csvFile" type="file" accept=".csv,text/csv" hidden></label><button class="btn secondary" id="exportCsv">Export CSV</button></div>
 <div id="syncStatus" class="note" role="status" aria-live="polite">Click Refresh NAV to retrieve the latest published prices from Kenanga Investors and Halogen Capital.</div><div class="tablewrap"><table><thead><tr><th>Fund</th><th class="num">NAV (RM)</th><th>NAV Date</th><th>Source</th><th>Status</th></tr></thead><tbody id="fundRows"></tbody></table></div>
 <div class="note">“Verified refresh” means the app retrieved a dated NAV from the official source during the latest refresh. “Reference / manual” means the displayed value is an initial reference, a previous saved value, or a manual/CSV entry; it has not been verified by the latest refresh. If a publisher does not expose a verifiable dated NAV, the app preserves the last saved value and does not mark it as freshly verified.</div>
+</section>
+<section id="performance" class="panel">
+ <div class="sectionhead"><div><h2>NAV Performance</h2><div class="note">View official historical NAV price and percentage return. Historical lookup is currently enabled for Kenanga Growth Fund.</div></div></div>
+ <div class="card">
+  <div class="fields">
+   <div class="field"><label>SELECT FUND</label><select id="performanceFund"></select></div>
+   <div class="field"><label>FROM DATE</label><input id="performanceFrom" type="date"></div>
+   <div class="field"><label>TO DATE</label><input id="performanceTo" type="date"></div>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:13px">
+   <button class="btn secondary period-btn" data-days="30">1M</button><button class="btn secondary period-btn" data-days="90">3M</button><button class="btn secondary period-btn" data-days="180">6M</button><button class="btn secondary period-btn" data-days="0">YTD</button><button class="btn" id="loadPerformance">Show Performance</button>
+  </div>
+  <div id="performanceStatus" class="note" role="status" aria-live="polite" style="margin-top:12px">Choose a fund and date range, then select Show Performance.</div>
+ </div>
+ <div class="grid" style="margin-top:14px">
+  <div class="stat"><small>Starting NAV</small><strong id="perfStartNav">—</strong></div>
+  <div class="stat"><small>Latest NAV</small><strong id="perfEndNav">—</strong></div>
+  <div class="stat"><small>NAV Difference</small><strong id="perfDiff">—</strong></div>
+  <div class="stat"><small>Total Return</small><strong id="perfReturn">—</strong></div>
+ </div>
+ <div class="card" style="margin-top:14px">
+  <div class="sectionhead" style="margin-top:0"><div><h2>Price & Return Trend</h2><div class="note">NAV price uses the left axis; cumulative return uses the right axis.</div></div><span class="pill">Dual-axis view</span></div>
+  <div id="performanceChart" style="min-height:260px;overflow:hidden"><div class="empty">Historical chart will appear when dated NAV records are available.</div></div>
+  <div class="note">Return is calculated from the first available NAV in the selected period: (NAV ÷ starting NAV − 1) × 100. It is price return and excludes distributions and fees.</div>
+ </div>
+ <div class="tablewrap" style="margin-top:14px"><table><thead><tr><th>Date</th><th class="num">NAV (RM)</th><th class="num">Return</th><th>Source</th></tr></thead><tbody id="performanceRows"><tr><td colspan="4" class="empty">No historical data loaded.</td></tr></tbody></table></div>
 </section>
 <section id="calc" class="panel">
 <div class="sectionhead"><div><h2>Cost Averaging Calculator</h2><div class="note">Enter each client payment. Choose separately whether service charge and SST apply to each transaction. Profit / Loss is calculated after applicable charges.</div></div></div>
@@ -113,5 +139,10 @@ $("refreshNav").onclick=async()=>{
  }catch(e){status.textContent="Refresh failed: "+e.message+". Existing NAV values were preserved. Check the server and official source."}
  finally{button.disabled=false;button.textContent="↻ Refresh NAV"}
 };
-setupSelects();renderFunds();$("currentNav").value=funds.find(f=>f.name===$("calcFund").value)?.nav??"";renderTx();calculate();
+function setupPerformance(){const sel=$("performanceFund");sel.innerHTML='<option value="Kenanga Growth Fund">Kenanga Growth Fund</option>';sel.value="Kenanga Growth Fund";const today=new Date();const to=today.toISOString().slice(0,10);const from=new Date(today);from.setDate(from.getDate()-90);$("performanceFrom").value=from.toISOString().slice(0,10);$("performanceTo").value=to;}
+function clearPerformance(message){["perfStartNav","perfEndNav","perfDiff","perfReturn"].forEach(id=>$(id).textContent="—");$("performanceChart").innerHTML='<div class="empty">Historical chart will appear when dated NAV records are available.</div>';$ ("performanceRows").innerHTML='<tr><td colspan="4" class="empty">No historical data loaded.</td></tr>';$("performanceStatus").textContent=message;}
+function drawPerformance(points){if(!points||points.length<2){clearPerformance("At least two dated NAV records are required to calculate performance.");return;}const first=points[0],last=points[points.length-1],diff=last.nav-first.nav,ret=(diff/first.nav)*100;$("perfStartNav").textContent="RM"+fmt(first.nav,4);$("perfEndNav").textContent="RM"+fmt(last.nav,4);$("perfDiff").textContent=(diff>=0?"+":"−")+"RM"+fmt(Math.abs(diff),4);$("perfReturn").textContent=(ret>=0?"+":"")+fmt(ret,2)+"%";$("perfReturn").className=ret>=0?"positive":"negative";const W=900,H=300,L=70,R=70,T=22,B=45,vals=points.map(p=>p.nav),min=Math.min(...vals),max=Math.max(...vals),pad=(max-min||Math.abs(max)*.02||.01)*.15,lo=min-pad,hi=max+pad;const xy=points.map((p,i)=>({x:L+i*(W-L-R)/(points.length-1),y:T+(hi-p.nav)/(hi-lo)*(H-T-B),r:((p.nav/first.nav)-1)*100}));const rmin=Math.min(0,...xy.map(p=>p.r)),rmax=Math.max(0,...xy.map(p=>p.r)),rpad=(rmax-rmin||1)*.15;const ry=v=>T+(rmax+rpad-v)/(rmax-rmin+2*rpad)*(H-T-B);const path=xy.map((p,i)=>(i?"L":"M")+p.x.toFixed(1)+","+p.y.toFixed(1)).join(" "),rpath=xy.map((p,i)=>(i?"L":"M")+p.x.toFixed(1)+","+ry(p.r).toFixed(1)).join(" ");const labels=[points[0].date,points[Math.floor(points.length/2)].date,points[points.length-1].date];$("performanceChart").innerHTML=`<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="NAV price and percentage return chart"><line x1="${L}" y1="${H-B}" x2="${W-R}" y2="${H-B}" stroke="#cbd5cf"/><line x1="${L}" y1="${T}" x2="${L}" y2="${H-B}" stroke="#cbd5cf"/><line x1="${W-R}" y1="${T}" x2="${W-R}" y2="${H-B}" stroke="#cbd5cf"/><path d="${path}" fill="none" stroke="#176b50" stroke-width="3" stroke-linecap="round"/><path d="${rpath}" fill="none" stroke="#c49b43" stroke-width="2.5" stroke-dasharray="7 5"/><text x="8" y="17" fill="#176b50" font-size="12">NAV (RM)</text><text x="${W-8}" y="17" text-anchor="end" fill="#a47b27" font-size="12">Return (%)</text>${xy.map(p=>`<circle cx="${p.x}" cy="${p.y}" r="3.5" fill="#176b50"/>`).join("")}${labels.map((v,i)=>`<text x="${[L,(L+W-R)/2,W-R][i]}" y="${H-14}" text-anchor="${i===0?"start":i===2?"end":"middle"}" fill="#697771" font-size="11">${v}</text>`).join("")}<text x="${L-8}" y="${T+8}" text-anchor="end" fill="#697771" font-size="10">${fmt(hi,4)}</text><text x="${L-8}" y="${H-B}" text-anchor="end" fill="#697771" font-size="10">${fmt(lo,4)}</text><text x="${W-R+8}" y="${T+8}" fill="#a47b27" font-size="10">${fmt(rmax+rpad,1)}%</text><text x="${W-R+8}" y="${H-B}" fill="#a47b27" font-size="10">${fmt(rmin-rpad,1)}%</text></svg><div class="note" style="display:flex;gap:18px;flex-wrap:wrap"><span style="color:#176b50">● NAV Price</span><span style="color:#a47b27">┄ Return %</span></div>`;$("performanceRows").innerHTML=points.map(p=>`<tr><td>${p.date}</td><td class="num">${fmt(p.nav,4)}</td><td class="num">${fmt((p.nav/first.nav-1)*100,2)}%</td><td>${p.source||"Official source"}</td></tr>`).join("");}
+async function loadPerformance(){const fund=$("performanceFund").value,from=$("performanceFrom").value,to=$("performanceTo").value;if(!fund||!from||!to||from>to){$("performanceStatus").textContent="Please choose a valid fund and date range.";return;}$("loadPerformance").disabled=true;$("performanceStatus").textContent="Retrieving dated NAV history…";try{const q=new URLSearchParams({fund,from,to});const res=await fetch("/api/nav/history?"+q.toString(),{cache:"no-store"});const data=await res.json();if(!res.ok)throw new Error(data.error||"Historical NAV is not available yet.");drawPerformance(data.points||[]);$("performanceStatus").textContent=`${(data.points||[]).length} dated NAV records · ${data.source_note||"Source data"}`;}catch(e){clearPerformance("Historical data connection is not ready: "+e.message+". No sample or estimated prices are shown.");}finally{$("loadPerformance").disabled=false;}}
+$("loadPerformance").onclick=loadPerformance;document.querySelectorAll(".period-btn").forEach(b=>b.onclick=()=>{const d=new Date(),days=Number(b.dataset.days);if(days===0)d.setMonth(0,1);else d.setDate(d.getDate()-days);$("performanceFrom").value=d.toISOString().slice(0,10);$("performanceTo").value=new Date().toISOString().slice(0,10);});
+setupSelects();setupPerformance();renderFunds();$("currentNav").value=funds.find(f=>f.name===$("calcFund").value)?.nav??"";renderTx();calculate();
 </script></body></html>
