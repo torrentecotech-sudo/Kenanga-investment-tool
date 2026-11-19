@@ -594,23 +594,41 @@ def api_nav_history():
 
 @app.get("/api/nav/history/check-all")
 def api_check_all_kenanga_history():
-    """Check full available historical NAV coverage for every verified Kenanga fund.
+    """Check historical NAV in small batches to avoid Render worker timeouts.
 
-    Returns only a compact summary (not all NAV rows). This is an operational
-    validation endpoint and can take some time because it paginates each fund's
-    official history from inception-range start through today's date.
+    Call repeatedly with offset=0,2,4,... until next_offset is null.
+    This route deliberately does not try all 15 funds in one HTTP request.
     """
     from_date = request.args.get("from_date", "01-01-1900")
     end_date = request.args.get("end_date", datetime.now().strftime("%d-%m-%Y"))
-    results = []
+    try:
+        offset = max(0, int(request.args.get("offset", "0")))
+        batch_size = min(3, max(1, int(request.args.get("batch_size", "2"))))
+    except ValueError:
+        return jsonify({"error": "offset and batch_size must be integers"}), 400
+
+    fund_names = list(KENANGA_MAPPING)
+    selected = fund_names[offset:offset + batch_size]
+    if not selected:
+        return jsonify({
+            "verified_fund_ids": len(KENANGA_FUND_IDS),
+            "total_funds": len(fund_names),
+            "offset": offset,
+            "funds": [],
+            "next_offset": None,
+            "complete": True,
+            "note": "All batches have been checked."
+        })
 
     def check_one(fund_name):
         try:
+            # One large DataTables page avoids repeated round trips for normal fund histories.
             result = fetch_kenanga_nav_history(
-                fund_name, from_date, end_date, page_size=100
+                fund_name, from_date, end_date, page_size=1000
             )
             rows = result.get("data", [])
             dates = [row["date"] for row in rows if row.get("date")]
+            latest = max(rows, key=lambda row: row["date"]) if rows else None
             return {
                 "fund": fund_name,
                 "fund_id": result["fund_id"],
@@ -618,8 +636,8 @@ def api_check_all_kenanga_history():
                 "records_total": result.get("records_total", 0),
                 "records_returned": len(rows),
                 "first_nav_date": min(dates) if dates else None,
-                "latest_nav_date": max(dates) if dates else None,
-                "latest_nav": next((row["nav"] for row in sorted(rows, key=lambda x: x["date"], reverse=True)), None),
+                "latest_nav_date": latest["date"] if latest else None,
+                "latest_nav": latest["nav"] if latest else None,
             }
         except Exception as exc:
             return {
@@ -629,23 +647,27 @@ def api_check_all_kenanga_history():
                 "error": str(exc)[:220],
             }
 
-    # Limit parallel load on Kenanga's official NAV endpoint.
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {pool.submit(check_one, name): name for name in KENANGA_MAPPING}
-        for future in as_completed(futures):
-            results.append(future.result())
+    with ThreadPoolExecutor(max_workers=min(2, len(selected))) as pool:
+        results = list(pool.map(check_one, selected))
 
-    results.sort(key=lambda item: list(KENANGA_MAPPING).index(item["fund"]))
+    next_offset = offset + len(selected)
+    if next_offset >= len(fund_names):
+        next_offset = None
     available = sum(1 for item in results if item["status"] == "history_available")
     return jsonify({
         "source": KENANGA_NAV_HISTORY_URL,
         "from_date": from_date,
         "end_date": end_date,
         "verified_fund_ids": len(KENANGA_FUND_IDS),
-        "history_available": available,
-        "total_funds": len(KENANGA_MAPPING),
+        "batch_size": batch_size,
+        "offset": offset,
+        "history_available_in_batch": available,
+        "batch_funds": len(results),
+        "total_funds": len(fund_names),
         "funds": results,
-        "note": "A fund is marked history_available only when dated NAV rows are returned by the official Kenanga historical NAV endpoint.",
+        "next_offset": next_offset,
+        "complete": next_offset is None,
+        "note": "Checks a small batch per request to avoid Render worker timeout. Repeat using next_offset until complete."
     })
 
 
