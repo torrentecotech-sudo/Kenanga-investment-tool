@@ -1,9 +1,11 @@
 """Kenanga + Halogen NAV backend. Render start command: gunicorn app:app"""
 from datetime import datetime, timezone
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import local
+from threading import local, Thread, Lock
+import time
 
 import requests
 from bs4 import BeautifulSoup
@@ -40,6 +42,129 @@ HALOGEN_MAPPING = {
     "Halogen Shariah Ethereum Fund": ["Halogen Shariah Ethereum Fund", "HALOGEN SHARIAH ETHERIUM FUND"],
 }
 ALL_FUNDS = list(KENANGA_MAPPING) + list(HALOGEN_MAPPING)
+
+
+# Supabase-backed ATH/ATL store. Configure SUPABASE_URL and
+# SUPABASE_SERVICE_ROLE_KEY in Render Environment. No Render Persistent Disk needed.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_READY = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+
+def _sb_headers(prefer=None):
+    if not SUPABASE_READY:
+        raise RuntimeError("Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Render.")
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def _sb_request(method, table, params=None, payload=None, prefer=None):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    response = requests.request(method, url, params=params, json=payload,
+                                headers=_sb_headers(prefer), timeout=(5, 20))
+    if response.status_code >= 400:
+        detail = response.text[:500]
+        raise RuntimeError(f"Supabase {table} request failed ({response.status_code}): {detail}")
+    if not response.text.strip():
+        return []
+    try:
+        return response.json()
+    except ValueError:
+        return []
+
+
+def _sb_get(table, params=None):
+    return _sb_request("GET", table, params=params or {"select": "*"})
+
+
+def _sb_upsert(table, payload, conflict):
+    return _sb_request("POST", table, params={"on_conflict": conflict}, payload=payload,
+                       prefer="resolution=merge-duplicates,return=representation")
+
+
+_bulk_lock = Lock()
+_bulk_thread = None
+_bulk_state = {"status": "idle", "current_fund": None, "current_year": None,
+               "completed_funds": 0, "total_funds": 15, "completed_years": 0,
+               "message": "No bulk scan has been started."}
+
+
+def _extreme_row(row):
+    if not row:
+        return None
+    return {
+        "fund": row.get("fund_name"), "fund_id": row.get("fund_id"),
+        "high": ({"nav": float(row["ath_nav"]), "date": row["ath_date"]}
+                 if row.get("ath_nav") is not None else None),
+        "low": ({"nav": float(row["atl_nav"]), "date": row["atl_date"]}
+                if row.get("atl_nav") is not None else None),
+        "nextYear": 1980,
+        "complete": bool(row.get("scan_complete")),
+        "lastChecked": row.get("last_checked_date"),
+        "recordsScanned": 0,
+    }
+
+
+def _get_extreme(fund_name):
+    rows = _sb_get("fund_extremes", {"select": "*", "fund_name": f"eq.{fund_name}", "limit": "1"})
+    return rows[0] if rows else None
+
+
+def _get_all_extremes():
+    return _sb_get("fund_extremes", {"select": "*", "order": "fund_name.asc", "limit": "100"})
+
+
+def _save_extreme(fund_name, fund_id, high, low, next_year, complete, records_count):
+    payload = {
+        "fund_name": fund_name, "fund_id": int(fund_id),
+        "ath_nav": high["nav"] if high else None,
+        "ath_date": high["date"] if high else None,
+        "atl_nav": low["nav"] if low else None,
+        "atl_date": low["date"] if low else None,
+        "scan_complete": bool(complete),
+        "last_checked_date": datetime.now(timezone.utc).date().isoformat(),
+        "coverage_start": "1980-01-01",
+        "coverage_end": datetime.now(timezone.utc).date().isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    rows = _sb_upsert("fund_extremes", payload, "fund_name")
+    return rows[0] if rows else _get_extreme(fund_name)
+
+
+def _get_progress(fund_name):
+    rows = _sb_get("scan_progress", {"select": "*", "fund_name": f"eq.{fund_name}", "limit": "1"})
+    return rows[0] if rows else None
+
+
+def _save_progress(fund_name, fund_id, next_year, last_completed_year, status, records_count):
+    payload = {"fund_name": fund_name, "fund_id": int(fund_id), "next_year": int(next_year),
+               "last_completed_year": last_completed_year, "status": status,
+               "records_count": int(records_count), "updated_at": datetime.now(timezone.utc).isoformat()}
+    return _sb_upsert("scan_progress", payload, "fund_name")
+
+
+def _bulk_job_state():
+    state = dict(_bulk_state)
+    if SUPABASE_READY:
+        try:
+            rows = _sb_get("scan_progress", {"select": "fund_name,status,last_completed_year,records_count", "limit": "100"})
+            state["completed_funds"] = sum(1 for r in rows if r.get("status") == "completed")
+            state["total_funds"] = len(KENANGA_FUND_IDS)
+            state["completed_years"] = sum(max(0, int(r.get("last_completed_year") or 1979) - 1979) for r in rows)
+        except Exception as exc:
+            state["message"] = f"Could not read Supabase scan progress: {str(exc)[:180]}"
+    return state
+
+
+def _set_bulk_job(**values):
+    _bulk_state.update(values)
+    _bulk_state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
@@ -714,9 +839,134 @@ def api_check_all_kenanga_history():
     })
 
 
+
+@app.get("/api/nav/extremes")
+def api_get_extremes():
+    """Return pre-saved ATH/ATL values from Supabase; no scan is performed."""
+    try:
+        rows = _get_all_extremes()
+        return jsonify({"funds": {row["fund_name"]: _extreme_row(row) for row in rows},
+                        "storage": "supabase"})
+    except Exception as exc:
+        return jsonify({"error": str(exc)[:300], "funds": {}, "storage": "supabase"}), 503
+
+
+@app.get("/api/nav/extremes/scan-year")
+def api_scan_extremes_year():
+    fund_name = request.args.get("fund", "").strip()
+    try:
+        year = int(request.args.get("year", ""))
+    except ValueError:
+        return jsonify({"error": "year must be an integer"}), 400
+    if fund_name not in KENANGA_FUND_IDS:
+        return jsonify({"error": "Fund ID is not verified for this fund"}), 400
+    if year < 1980 or year > datetime.now().year:
+        return jsonify({"error": f"year must be between 1980 and {datetime.now().year}"}), 400
+    try:
+        result = fetch_kenanga_nav_history(fund_name, f"01-01-{year}",
+            f"31-12-{year}" if year < datetime.now().year else datetime.now().strftime("%d-%m-%Y"), page_size=100)
+        points = sorted([{"nav": row["nav"], "date": row["date"]} for row in result.get("data", [])], key=lambda x: x["date"])
+        old = _get_extreme(fund_name)
+        state = _extreme_row(old) or {"high": None, "low": None, "recordsScanned": 0}
+        high, low = state["high"], state["low"]
+        for point in points:
+            if high is None or point["nav"] > high["nav"]: high = point
+            if low is None or point["nav"] < low["nav"]: low = point
+        next_year = max(year + 1, int(state.get("nextYear") or 1980))
+        complete = next_year > datetime.now().year
+        saved = _save_extreme(fund_name, result["fund_id"], high, low, next_year, complete,
+                              state["recordsScanned"] + len(points))
+        _save_progress(fund_name, result["fund_id"], next_year, year,
+                       "completed" if complete else "running", state["recordsScanned"] + len(points))
+        return jsonify({"ok": True, "year": year, "records_returned": len(points), "state": _extreme_row(saved)})
+    except requests.Timeout:
+        return jsonify({"error": f"Kenanga timed out for {fund_name} ({year}); saved progress is unchanged. Retry this year."}), 504
+    except Exception as exc:
+        return jsonify({"error": str(exc)[:300]}), 502
+
+
+def _run_bulk_extremes_scan():
+    try:
+        names = list(KENANGA_FUND_IDS.keys())
+        _set_bulk_job(status="running", current_fund=None, current_year=None,
+                      completed_funds=0, total_funds=len(names), completed_years=0,
+                      message="Historical scan started on Render; results are saved in Supabase.")
+        current_year = datetime.now().year
+        for fund_name in names:
+            fund_id = KENANGA_FUND_IDS[fund_name]
+            progress = _get_progress(fund_name) or {"next_year": 1980, "last_completed_year": 1979,
+                                                     "records_count": 0, "status": "pending"}
+            saved = _get_extreme(fund_name)
+            state = _extreme_row(saved) or {"high": None, "low": None, "recordsScanned": 0, "complete": False}
+            start_year = int(progress.get("next_year") or 1980)
+            if progress.get("status") == "completed" or state.get("complete"):
+                start_year = current_year
+            high, low = state.get("high"), state.get("low")
+            records_count = int(progress.get("records_count") or state.get("recordsScanned") or 0)
+            last_completed = int(progress.get("last_completed_year") or (start_year - 1))
+            for year in range(max(1980, start_year), current_year + 1):
+                _set_bulk_job(status="running", current_fund=fund_name, current_year=year,
+                              message=f"Scanning {fund_name} · {year}")
+                start = f"01-01-{year}"
+                end = f"31-12-{year}" if year < current_year else datetime.now().strftime("%d-%m-%Y")
+                result = fetch_kenanga_nav_history(fund_name, start, end, page_size=100)
+                points = sorted([{"nav": row["nav"], "date": row["date"]}
+                                 for row in result.get("data", [])], key=lambda x: x["date"])
+                for point in points:
+                    if high is None or point["nav"] > high["nav"]: high = point
+                    if low is None or point["nav"] < low["nav"]: low = point
+                records_count += len(points)
+                next_year = year + 1
+                complete = next_year > current_year
+                _save_extreme(fund_name, result["fund_id"], high, low, next_year, complete, records_count)
+                _save_progress(fund_name, fund_id, next_year, year,
+                               "completed" if complete else "running", records_count)
+                last_completed = year
+                _set_bulk_job(completed_years=int(_bulk_state.get("completed_years", 0)) + 1)
+                time.sleep(0.2)
+            _save_progress(fund_name, fund_id, current_year, last_completed, "completed", records_count)
+            _set_bulk_job(completed_funds=int(_bulk_state.get("completed_funds", 0)) + 1)
+        _set_bulk_job(status="completed", current_fund=None, current_year=None,
+                      completed_funds=len(names), total_funds=len(names),
+                      message="Historical ATH/ATL scan completed for all verified Kenanga funds.")
+    except Exception as exc:
+        _set_bulk_job(status="paused", message=f"Scan paused: {str(exc)[:240]}. Completed years remain saved in Supabase; press Scan / Update to resume.")
+    finally:
+        global _bulk_thread
+        with _bulk_lock:
+            _bulk_thread = None
+
+
+@app.post("/api/nav/extremes/bulk-start")
+def api_start_bulk_extremes():
+    global _bulk_thread
+    if not SUPABASE_READY:
+        return jsonify({"error": "Supabase is not configured. Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Render."}), 503
+    with _bulk_lock:
+        if _bulk_thread is not None and _bulk_thread.is_alive():
+            return jsonify({"ok": True, "already_running": True, "job": _bulk_job_state()})
+        try:
+            # Test credentials/table access before starting the background worker.
+            _sb_get("fund_extremes", {"select": "fund_name", "limit": "1"})
+            _sb_get("scan_progress", {"select": "fund_name", "limit": "1"})
+        except Exception as exc:
+            return jsonify({"error": f"Supabase connection check failed: {str(exc)[:240]}"}), 503
+        _bulk_thread = Thread(target=_run_bulk_extremes_scan, daemon=True, name="kenanga-ath-atl-scan")
+        _bulk_thread.start()
+    return jsonify({"ok": True, "started": True, "job": _bulk_job_state()}), 202
+
+
+@app.get("/api/nav/extremes/bulk-status")
+def api_bulk_extremes_status():
+    try:
+        funds = {row["fund_name"]: _extreme_row(row) for row in _get_all_extremes()}
+        return jsonify({"job": _bulk_job_state(), "funds": funds})
+    except Exception as exc:
+        return jsonify({"error": str(exc)[:300]}), 503
+
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "service": "kenanga-halogen-nav"})
+    return jsonify({"status": "ok", "service": "kenanga-halogen-nav", "supabase_configured": SUPABASE_READY})
 
 
 if __name__ == "__main__":
