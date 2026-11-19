@@ -2,6 +2,8 @@
 from datetime import datetime, timezone
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import local
 
 import requests
 from bs4 import BeautifulSoup
@@ -208,7 +210,10 @@ def extract_halogen_kenwealth_fallback(html):
 
 # Historical NAV endpoint discovered from Kenanga Investors browser Network capture.
 KENANGA_NAV_HISTORY_URL = "https://www.kenangainvestors.com.my/fund/fund/ajax-get-fund-nav-list"
-KENANGA_FUND_IDS = {"Kenanga Growth Fund": 49}
+KENANGA_FUND_IDS = {
+    "Kenanga Growth Fund": 49,
+    "Kenanga Syariah Growth Fund": 30,
+}
 
 
 def _history_form_payload(fund_id, from_date, end_date, draw, start, length):
@@ -320,30 +325,116 @@ def _extract_fund_id_candidates(html):
     return sorted(found)
 
 
-def fetch_kenanga_nav_history_candidate(fund_name, fund_id):
-    """Validate a candidate ID with a small official historical-NAV request."""
-    session = requests.Session()
-    headers = {
-        "User-Agent": HEADERS["User-Agent"],
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Origin": "https://www.kenangainvestors.com.my",
-        "Referer": "https://www.kenangainvestors.com.my/",
-        "X-Requested-With": "XMLHttpRequest",
+_KENANGA_WORKER = local()
+
+
+def _probe_kenanga_id(fund_id):
+    """Return the newest dated NAV row for a numeric ID, if the ID is valid."""
+    session = getattr(_KENANGA_WORKER, "session", None)
+    try:
+        if session is None:
+            session = requests.Session()
+            session.headers.update(HEADERS)
+            session.get("https://www.kenangainvestors.com.my/", timeout=15)
+            _KENANGA_WORKER.session = session
+        ajax_headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://www.kenangainvestors.com.my",
+            "Referer": "https://www.kenangainvestors.com.my/",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        form = _history_form_payload(
+            fund_id, "01-01-2000", datetime.now().strftime("%d-%m-%Y"), 1, 0, 1
+        )
+        response = session.post(KENANGA_NAV_HISTORY_URL, data=form, headers=ajax_headers, timeout=20)
+        response.raise_for_status()
+        body = response.json()
+        rows = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(rows, list) or not rows:
+            return None
+        row = rows[0]
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            return None
+        date_iso, nav = parse_date(row[0]), parse_price(row[2])
+        if date_iso and nav is not None:
+            return {"fund_id": fund_id, "date": date_iso, "nav": round(nav, 8)}
+    except Exception:
+        return None
+    return None
+
+
+def discover_kenanga_fund_ids(max_id=200):
+    """Bulk-discover IDs by matching historical endpoint NAV rows to the official fund list.
+
+    No profile-page scraping is used because Cloudflare may return HTTP 403 to Render.
+    A fund is accepted only when one scanned ID uniquely matches its latest list NAV
+    on both date and price.
+    """
+    html = request_html(KENANGA_SOURCE)
+    current_prices = extract_kenanga(html)
+    targets = {
+        name: {"date": record["date"], "nav": round(record["nav"], 8)}
+        for name, record in current_prices.items() if name in KENANGA_MAPPING
     }
-    session.get("https://www.kenangainvestors.com.my/", headers=HEADERS, timeout=20)
-    form = _history_form_payload(fund_id, "01-01-2000", datetime.now().strftime("%d-%m-%Y"), 1, 0, 2)
-    response = session.post(KENANGA_NAV_HISTORY_URL, data=form, headers=headers, timeout=25)
-    response.raise_for_status()
-    body = response.json()
-    rows = body.get("data") if isinstance(body, dict) else None
-    if not isinstance(rows, list) or not rows:
-        return False
-    return any(
-        isinstance(row, (list, tuple)) and len(row) >= 4
-        and parse_date(row[0]) and parse_price(row[2]) is not None
-        for row in rows
-    )
+
+    # Keep IDs that have already been confirmed from the user's browser/network capture.
+    matches = {name: fund_id for name, fund_id in KENANGA_FUND_IDS.items()}
+    reverse = {fund_id: name for name, fund_id in matches.items()}
+    ids_to_scan = [i for i in range(1, max_id + 1) if i not in reverse]
+    probed = []
+    # Moderate concurrency avoids a long serial scan while limiting load on the source.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_probe_kenanga_id, fund_id): fund_id for fund_id in ids_to_scan}
+        for future in as_completed(futures):
+            row = future.result()
+            if row:
+                probed.append(row)
+
+    # Exact date + NAV match only. Multiple matches are intentionally left unresolved.
+    target_to_ids = {}
+    for row in probed:
+        key = (row["date"], row["nav"])
+        target_to_ids.setdefault(key, []).append(row["fund_id"])
+
+    for fund_name, target in targets.items():
+        if fund_name in matches:
+            continue
+        key = (target["date"], target["nav"])
+        candidate_ids = target_to_ids.get(key, [])
+        if len(candidate_ids) == 1:
+            matches[fund_name] = candidate_ids[0]
+
+    # Only persist uniquely matched IDs in this running app process.
+    for fund_name, fund_id in matches.items():
+        KENANGA_FUND_IDS[fund_name] = fund_id
+
+    results = []
+    for fund_name in KENANGA_MAPPING:
+        fund_id = matches.get(fund_name)
+        if fund_id is not None:
+            results.append({"fund": fund_name, "fund_id": fund_id, "status": "verified"})
+        elif fund_name not in targets:
+            results.append({"fund": fund_name, "fund_id": None, "status": "not_in_current_fund_list"})
+        else:
+            target = targets[fund_name]
+            candidate_ids = target_to_ids.get((target["date"], target["nav"]), [])
+            results.append({
+                "fund": fund_name, "fund_id": None,
+                "status": "ambiguous" if len(candidate_ids) > 1 else "not_matched",
+                "candidate_ids": candidate_ids,
+                "latest_nav_date": target["date"], "latest_nav": target["nav"],
+            })
+
+    return {
+        "source": KENANGA_SOURCE,
+        "verified": sum(1 for item in results if item["status"] == "verified"),
+        "total": len(KENANGA_MAPPING),
+        "scanned_id_range": [1, max_id],
+        "valid_ids_found": len(probed),
+        "funds": results,
+        "note": "IDs are verified only when a unique latest NAV date and price match is found. Ambiguous or unmatched funds are not guessed. Increase max_id query parameter to scan a wider range.",
+    }
 
 
 def _kenanga_profile_url(href, fund_name):
@@ -365,54 +456,6 @@ def _kenanga_profile_url(href, fund_name):
         if slug:
             return f"https://www.kenangainvestors.com.my/{slug}"
     return absolute
-
-
-def discover_kenanga_fund_ids():
-    """Find official fund profiles, extract candidate IDs, and validate before adding them."""
-    soup = BeautifulSoup(request_html(KENANGA_SOURCE), "html.parser")
-    aliases = {norm(alias): name for name, values in KENANGA_MAPPING.items() for alias in values}
-    links = {}
-    for anchor in soup.find_all("a", href=True):
-        label = norm(anchor.get_text(" ", strip=True))
-        fund_name = aliases.get(label)
-        if fund_name:
-            links[fund_name] = _kenanga_profile_url(anchor["href"].strip(), fund_name)
-
-    results = []
-    for fund_name in KENANGA_MAPPING:
-        if fund_name in KENANGA_FUND_IDS:
-            results.append({"fund": fund_name, "fund_id": KENANGA_FUND_IDS[fund_name], "status": "verified"})
-            continue
-        page_url = links.get(fund_name)
-        if not page_url:
-            results.append({"fund": fund_name, "fund_id": None, "status": "not_found", "detail": "No exact matching detail link found on official fund list"})
-            continue
-        try:
-            html = request_html(page_url)
-            page_text = norm(BeautifulSoup(html, "html.parser").get_text(" ", strip=True))
-            if not any(norm(alias) in page_text for alias in KENANGA_MAPPING[fund_name]):
-                results.append({"fund": fund_name, "fund_id": None, "status": "name_not_confirmed", "page": page_url})
-                continue
-            candidates = _extract_fund_id_candidates(html)
-            verified_id = None
-            for candidate in candidates:
-                if fetch_kenanga_nav_history_candidate(fund_name, candidate):
-                    verified_id = candidate
-                    break
-            if verified_id is not None:
-                KENANGA_FUND_IDS[fund_name] = verified_id
-                results.append({"fund": fund_name, "fund_id": verified_id, "status": "verified", "page": page_url})
-            else:
-                results.append({"fund": fund_name, "fund_id": None, "status": "needs_manual_review", "candidates_checked": candidates, "page": page_url})
-        except Exception as exc:
-            results.append({"fund": fund_name, "fund_id": None, "status": "error", "detail": str(exc)[:180], "page": page_url})
-    return {
-        "source": KENANGA_SOURCE,
-        "verified": sum(1 for item in results if item["status"] == "verified"),
-        "total": len(KENANGA_MAPPING),
-        "funds": results,
-        "note": "Only IDs extracted from matching official fund pages and validated against the historical NAV endpoint are accepted."
-    }
 
 
 def refresh_payload():
@@ -488,7 +531,12 @@ def api_nav():
 @app.get("/api/nav/fund-ids/discover")
 def api_discover_fund_ids():
     try:
-        return jsonify(discover_kenanga_fund_ids())
+        try:
+            max_id = int(request.args.get("max_id", "200"))
+        except ValueError:
+            max_id = 200
+        max_id = max(50, min(max_id, 500))
+        return jsonify(discover_kenanga_fund_ids(max_id=max_id))
     except Exception as exc:
         return jsonify({"error": str(exc)[:250]}), 502
 
