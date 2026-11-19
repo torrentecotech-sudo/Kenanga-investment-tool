@@ -273,11 +273,11 @@ def fetch_kenanga_nav_history(fund_name, from_date, end_date, page_size=100):
         "X-Requested-With": "XMLHttpRequest",
     }
     # Establish first-party cookies without copying a user's browser cookie into the app.
-    session.get("https://www.kenangainvestors.com.my/", headers=HEADERS, timeout=25)
+    session.get("https://www.kenangainvestors.com.my/", headers=HEADERS, timeout=(4, 8))
     all_rows, start, draw, total = [], 0, 1, None
     while total is None or start < total:
         form = _history_form_payload(fund_id, from_date, end_date, draw, start, page_size)
-        response = session.post(KENANGA_NAV_HISTORY_URL, data=form, headers=headers, timeout=30)
+        response = session.post(KENANGA_NAV_HISTORY_URL, data=form, headers=headers, timeout=(4, 10))
         response.raise_for_status()
         try:
             body = response.json()
@@ -594,17 +594,17 @@ def api_nav_history():
 
 @app.get("/api/nav/history/check-all")
 def api_check_all_kenanga_history():
-    """Check exactly one fund per request to keep Render workers responsive.
+    """Check one fund for one calendar year per request.
 
-    Call with offset=0, then use the returned next_offset (1, 2, ...).
-    This intentionally avoids concurrent calls and large multi-fund requests.
+    This keeps historical lookups bounded: the old 2000-to-current request
+    could make Kenanga's upstream endpoint stall long enough for Gunicorn to
+    kill the worker. Continue with next_offset / next_year from the response.
     """
-    from_date = request.args.get("from_date", "01-01-2000")
-    end_date = request.args.get("end_date", datetime.now().strftime("%d-%m-%Y"))
     try:
         offset = max(0, int(request.args.get("offset", "0")))
+        year = int(request.args.get("year", str(datetime.now().year)))
     except ValueError:
-        return jsonify({"error": "offset must be an integer"}), 400
+        return jsonify({"error": "offset and year must be integers"}), 400
 
     fund_names = list(KENANGA_MAPPING)
     if offset >= len(fund_names):
@@ -612,21 +612,22 @@ def api_check_all_kenanga_history():
             "verified_fund_ids": len(KENANGA_FUND_IDS),
             "total_funds": len(fund_names),
             "offset": offset,
+            "year": year,
             "funds": [],
             "next_offset": None,
-            "complete": True,
-            "note": "All funds have been checked."
+            "next_year": year - 1 if year > 2000 else None,
+            "complete": year <= 2000,
+            "note": "No more funds in this year. Set offset=0 and use next_year to continue with the previous year.",
         })
+    if year < 2000 or year > datetime.now().year:
+        return jsonify({"error": f"year must be between 2000 and {datetime.now().year}"}), 400
 
     fund_name = fund_names[offset]
+    from_date = f"01-01-{year}"
+    end_date = f"31-12-{year}" if year < datetime.now().year else datetime.now().strftime("%d-%m-%Y")
     try:
-        # Keep each request bounded; fetch_kenanga_nav_history paginates in
-        # 100-row pages and returns the full date range for this one fund.
-        result = fetch_kenanga_nav_history(
-            fund_name, from_date, end_date, page_size=100
-        )
+        result = fetch_kenanga_nav_history(fund_name, from_date, end_date, page_size=50)
         rows = result.get("data", [])
-        dates = [row["date"] for row in rows if row.get("date")]
         latest = max(rows, key=lambda row: row["date"]) if rows else None
         earliest = min(rows, key=lambda row: row["date"]) if rows else None
         fund_result = {
@@ -642,6 +643,12 @@ def api_check_all_kenanga_history():
             "highest_nav": max((row["nav"] for row in rows), default=None),
             "lowest_nav": min((row["nav"] for row in rows), default=None),
         }
+    except requests.Timeout as exc:
+        fund_result = {
+            "fund": fund_name, "fund_id": KENANGA_FUND_IDS.get(fund_name),
+            "status": "upstream_timeout",
+            "error": "Kenanga's historical NAV server did not respond within the short timeout. Retry this fund/year later.",
+        }
     except Exception as exc:
         fund_result = {
             "fund": fund_name,
@@ -650,20 +657,21 @@ def api_check_all_kenanga_history():
             "error": str(exc)[:220],
         }
 
-    next_offset = offset + 1
-    if next_offset >= len(fund_names):
-        next_offset = None
+    next_offset = offset + 1 if offset + 1 < len(fund_names) else 0
+    next_year = year if next_offset else (year - 1 if year > 2000 else None)
     return jsonify({
         "source": KENANGA_NAV_HISTORY_URL,
         "from_date": from_date,
         "end_date": end_date,
+        "year": year,
         "verified_fund_ids": len(KENANGA_FUND_IDS),
         "offset": offset,
         "total_funds": len(fund_names),
         "funds": [fund_result],
-        "next_offset": next_offset,
-        "complete": next_offset is None,
-        "note": "One fund per request; continue with next_offset. NAV high/low are limited to the requested date range."
+        "next_offset": next_offset if next_year is not None else None,
+        "next_year": next_year,
+        "complete": next_year is None,
+        "note": "One fund and one calendar year per request. Continue using next_offset and next_year. High/low values cover only the returned year, not all-time history.",
     })
 
 
