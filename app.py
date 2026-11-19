@@ -592,6 +592,45 @@ def api_nav_history():
         return jsonify({"error": str(exc)[:250]}), 502
 
 
+
+@app.get("/api/nav/history/year")
+def api_nav_history_year():
+    """Return one calendar year's official NAV history for a fund.
+
+    The browser calls this endpoint year-by-year, allowing all-time highs/lows
+    to be calculated from the earliest available records without one huge
+    request that can time out on the upstream publisher.
+    """
+    fund_name = request.args.get("fund", "").strip()
+    try:
+        year = int(request.args.get("year", ""))
+    except ValueError:
+        return jsonify({"error": "year must be an integer"}), 400
+    if fund_name not in KENANGA_FUND_IDS:
+        return jsonify({"error": "Historical NAV is currently supported only for verified Kenanga fund IDs"}), 400
+    if year < 1980 or year > datetime.now().year:
+        return jsonify({"error": f"year must be between 1980 and {datetime.now().year}"}), 400
+    from_date = f"01-01-{year}"
+    end_date = f"31-12-{year}" if year < datetime.now().year else datetime.now().strftime("%d-%m-%Y")
+    try:
+        result = fetch_kenanga_nav_history(fund_name, from_date, end_date, page_size=100)
+        points = sorted(
+            [{"date": row["date"], "nav": row["nav"]} for row in result.get("data", [])],
+            key=lambda item: item["date"]
+        )
+        return jsonify({
+            "fund": fund_name, "fund_id": result["fund_id"], "year": year,
+            "from_date": from_date, "end_date": end_date, "points": points,
+            "records_returned": len(points),
+            "source": "Kenanga Investors · official historical NAV"
+        })
+    except requests.Timeout:
+        return jsonify({"error": f"Kenanga history request timed out for {fund_name} ({year}). Retry this year."}), 504
+    except requests.RequestException as exc:
+        return jsonify({"error": "Kenanga request failed: " + str(exc)[:180]}), 502
+    except Exception as exc:
+        return jsonify({"error": str(exc)[:220]}), 502
+
 @app.get("/api/nav/history/check-all")
 def api_check_all_kenanga_history():
     """Check one fund for one calendar year per request.
