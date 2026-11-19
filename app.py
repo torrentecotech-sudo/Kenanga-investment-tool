@@ -594,22 +594,20 @@ def api_nav_history():
 
 @app.get("/api/nav/history/check-all")
 def api_check_all_kenanga_history():
-    """Check historical NAV in small batches to avoid Render worker timeouts.
+    """Check exactly one fund per request to keep Render workers responsive.
 
-    Call repeatedly with offset=0,2,4,... until next_offset is null.
-    This route deliberately does not try all 15 funds in one HTTP request.
+    Call with offset=0, then use the returned next_offset (1, 2, ...).
+    This intentionally avoids concurrent calls and large multi-fund requests.
     """
-    from_date = request.args.get("from_date", "01-01-1900")
+    from_date = request.args.get("from_date", "01-01-2000")
     end_date = request.args.get("end_date", datetime.now().strftime("%d-%m-%Y"))
     try:
         offset = max(0, int(request.args.get("offset", "0")))
-        batch_size = min(3, max(1, int(request.args.get("batch_size", "2"))))
     except ValueError:
-        return jsonify({"error": "offset and batch_size must be integers"}), 400
+        return jsonify({"error": "offset must be an integer"}), 400
 
     fund_names = list(KENANGA_MAPPING)
-    selected = fund_names[offset:offset + batch_size]
-    if not selected:
+    if offset >= len(fund_names):
         return jsonify({
             "verified_fund_ids": len(KENANGA_FUND_IDS),
             "total_funds": len(fund_names),
@@ -617,57 +615,55 @@ def api_check_all_kenanga_history():
             "funds": [],
             "next_offset": None,
             "complete": True,
-            "note": "All batches have been checked."
+            "note": "All funds have been checked."
         })
 
-    def check_one(fund_name):
-        try:
-            # One large DataTables page avoids repeated round trips for normal fund histories.
-            result = fetch_kenanga_nav_history(
-                fund_name, from_date, end_date, page_size=1000
-            )
-            rows = result.get("data", [])
-            dates = [row["date"] for row in rows if row.get("date")]
-            latest = max(rows, key=lambda row: row["date"]) if rows else None
-            return {
-                "fund": fund_name,
-                "fund_id": result["fund_id"],
-                "status": "history_available" if rows else "no_records_in_range",
-                "records_total": result.get("records_total", 0),
-                "records_returned": len(rows),
-                "first_nav_date": min(dates) if dates else None,
-                "latest_nav_date": latest["date"] if latest else None,
-                "latest_nav": latest["nav"] if latest else None,
-            }
-        except Exception as exc:
-            return {
-                "fund": fund_name,
-                "fund_id": KENANGA_FUND_IDS.get(fund_name),
-                "status": "error",
-                "error": str(exc)[:220],
-            }
+    fund_name = fund_names[offset]
+    try:
+        # Keep each request bounded; fetch_kenanga_nav_history paginates in
+        # 100-row pages and returns the full date range for this one fund.
+        result = fetch_kenanga_nav_history(
+            fund_name, from_date, end_date, page_size=100
+        )
+        rows = result.get("data", [])
+        dates = [row["date"] for row in rows if row.get("date")]
+        latest = max(rows, key=lambda row: row["date"]) if rows else None
+        earliest = min(rows, key=lambda row: row["date"]) if rows else None
+        fund_result = {
+            "fund": fund_name,
+            "fund_id": result["fund_id"],
+            "status": "history_available" if rows else "no_records_in_range",
+            "records_total": result.get("records_total", 0),
+            "records_returned": len(rows),
+            "first_nav_date": earliest["date"] if earliest else None,
+            "first_nav": earliest["nav"] if earliest else None,
+            "latest_nav_date": latest["date"] if latest else None,
+            "latest_nav": latest["nav"] if latest else None,
+            "highest_nav": max((row["nav"] for row in rows), default=None),
+            "lowest_nav": min((row["nav"] for row in rows), default=None),
+        }
+    except Exception as exc:
+        fund_result = {
+            "fund": fund_name,
+            "fund_id": KENANGA_FUND_IDS.get(fund_name),
+            "status": "error",
+            "error": str(exc)[:220],
+        }
 
-    with ThreadPoolExecutor(max_workers=min(2, len(selected))) as pool:
-        results = list(pool.map(check_one, selected))
-
-    next_offset = offset + len(selected)
+    next_offset = offset + 1
     if next_offset >= len(fund_names):
         next_offset = None
-    available = sum(1 for item in results if item["status"] == "history_available")
     return jsonify({
         "source": KENANGA_NAV_HISTORY_URL,
         "from_date": from_date,
         "end_date": end_date,
         "verified_fund_ids": len(KENANGA_FUND_IDS),
-        "batch_size": batch_size,
         "offset": offset,
-        "history_available_in_batch": available,
-        "batch_funds": len(results),
         "total_funds": len(fund_names),
-        "funds": results,
+        "funds": [fund_result],
         "next_offset": next_offset,
         "complete": next_offset is None,
-        "note": "Checks a small batch per request to avoid Render worker timeout. Repeat using next_offset until complete."
+        "note": "One fund per request; continue with next_offset. NAV high/low are limited to the requested date range."
     })
 
 
