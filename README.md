@@ -1,42 +1,54 @@
-# Kenanga + Halogen Investment Dashboard (Base Project)
+# Kenanga Adviser Tool
+
+Flask dashboard for selected Kenanga and Halogen funds.
 
 ## Deploy to Render
 - Build command: `pip install -r requirements.txt`
 - Start command: `gunicorn app:app`
-- Keep `app.py` in the repository root.
-- Keep `index.html` inside `templates/`.
+- Keep `app.py` in the repository root and `index.html` in `templates/`.
+- `server.py` is a lightweight local static/server helper; Render should run the Flask app through the Procfile.
 
-## Included funds
-- 13 selected Kenanga funds
+## Selected funds (18)
+- 15 Kenanga funds, including Kenanga Alternative Series: Global Real Assets Fund and Kenanga Shariah US Titans 50 Fund.
+- Halogen Shariah Bitcoin Fund
 - Halogen Shariah Crypto Titans Fund
 - Halogen Shariah Ethereum Fund
 
-## Official sources
-- Kenanga Investors: https://www.kenangainvestors.com.my/fund-list
-- Halogen Capital: https://www.halogen.my/fund/price/
+## Official price and history sources
+- Kenanga current NAV: https://www.kenangainvestors.com.my/fund-list
+- Kenanga historical NAV endpoint: https://www.kenangainvestors.com.my/fund/fund/ajax-get-fund-nav-list
+- Halogen API: `https://api2.halogen.my/query`
+  - Current daily NAV action: `list_daily_fund_prices`
+  - Historical NAV action: `list_fund_net_asset_value`
+- Halogen fund identifiers are maintained in `HALOGEN_FUNDS` in `app.py`.
 
-## NAV safety rules
-- Kenanga parser reads the table headers `Fund Name`, `NAV Date`, and `NAV Price`.
-- It does not use `NAV Change` as the fund price.
-- A record is accepted only when an exact selected fund name, a valid NAV date, and a positive NAV Price are present.
-- The Halogen parser checks the official price page's server-rendered tables and embedded JSON. If Halogen loads prices only after client-side JavaScript and does not include the data in the HTML response, the API reports those funds as unavailable. It will not guess a price or silently substitute a third-party value.
-- The UI keeps the last saved/reference NAV when a refresh fails or returns only partial results.
+The app validates dated NAV records and does not substitute NAV-change percentages for NAV prices. Halogen API connectivity and response shape should be confirmed in the deployed Render environment; the app reports an error rather than fabricating data if the upstream schema changes.
 
-## API endpoints
-- `/api/nav` — refresh selected official sources and return matched prices, missing funds, and source diagnostics.
-- `/health` — service health check.
+## Historical performance
+- Period shortcuts: 1M, 3M, 6M, YTD, 1Y, 3Y, 5Y and Since Inception.
+- Custom from/to dates are available.
+- Kenanga requests are split into calendar-year chunks to avoid one large historical request timing out.
+- Halogen history is requested from the official API using `timeframe=all`, then filtered to the selected dates.
+- Return is NAV price return and excludes distributions and fees.
 
-## Initial reference NAVs
-Initial values in the browser are reference values dated 16 Nov 2026, including the Halogen prices shown in the user's screenshot. They are not represented as a live refresh. A successful API refresh replaces them only when a dated official NAV is parsed and validated.
+## ATH / ATL
+- Kenanga ATH/ATL scan is saved in Supabase using the existing `fund_extremes` and `scan_progress` tables.
+- Halogen ATH/ATL is calculated from the official history API response when the extremes endpoint is requested; it is not written to the existing numeric `fund_id` Supabase table.
+- Configure `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in Render for persistent Kenanga scan progress.
 
 ## Cost averaging
-- Client payment is gross amount.
-- Service charge and SST toggle is per transaction (enabled by default).
-- Service charge 3%; SST 8% on service charge.
-- Net investment = gross / (1 + service charge rate * (1 + SST rate)) when charges are enabled.
+- Gross client payment is the total amount paid.
+- Service charge: 3%; SST: 8% of service charge.
+- Net investment when charges apply: `gross / (1 + service charge rate * (1 + SST rate))`.
+- Charge toggle is per transaction and defaults to on.
 - Units = net investment / purchase NAV.
 - Average cost = total net investment / total units.
-- Profit/Loss = current value - total net investment.
-- Return = Profit/Loss / total net investment.
+- Profit/loss = current value - total net investment.
+- Return = profit/loss / total net investment.
 
-This is an adviser reference/simulation tool, not a transaction or dealing platform. Verify NAV dates, charges, dealing cut-offs, share classes and investor eligibility against the relevant official documents before client use.
+## Data limitations
+- Top 5 holdings are intentionally not displayed: no verified official holdings feed or factsheet archive is connected in this project. Do not populate holdings with inferred or invented securities.
+- NAV change is shown as unavailable unless the upstream current-price source supplies a separately validated change field. The current integration does not invent a daily change.
+- Current reference NAVs in the browser are fallback display values only. A successful official refresh replaces them with dated source records.
+
+This is an adviser reference/simulation tool, not a transaction or dealing platform. Verify NAV dates, charges, dealing cut-offs, share classes and investor eligibility against official fund documents before client use.

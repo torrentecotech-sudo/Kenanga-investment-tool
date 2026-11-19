@@ -38,9 +38,17 @@ KENANGA_MAPPING = {
 }
 
 HALOGEN_MAPPING = {
+    "Halogen Shariah Bitcoin Fund": ["Halogen Shariah Bitcoin Fund"],
     "Halogen Shariah Crypto Titans Fund": ["Halogen Shariah Crypto Titans Fund", "HALOGEN SHARIAH CRYPTO TITANS FUND"],
     "Halogen Shariah Ethereum Fund": ["Halogen Shariah Ethereum Fund", "HALOGEN SHARIAH ETHERIUM FUND"],
 }
+HALOGEN_API = "https://api2.halogen.my/query"
+HALOGEN_FUNDS = {
+    "Halogen Shariah Bitcoin Fund": "1d3ede3d8023fb76a6b73ab2972bdc28b73cc549",
+    "Halogen Shariah Crypto Titans Fund": "36b15668cad57d279c63f4529af0c527603f9983",
+    "Halogen Shariah Ethereum Fund": "bab842d7c4e6187ea42f6fa0d7a0d302aecbf6ad",
+}
+
 ALL_FUNDS = list(KENANGA_MAPPING) + list(HALOGEN_MAPPING)
 
 
@@ -598,6 +606,91 @@ def _kenanga_profile_url(href, fund_name):
     return absolute
 
 
+def _halogen_post(name, payload=None):
+    body = {"name": name, "payloadJSON": json.dumps(payload or {}, separators=(",", ":"))}
+    response = requests.post(HALOGEN_API, json=body, headers={
+        "Content-Type": "application/json", "Origin": "https://halogen.my",
+        "Referer": "https://halogen.my/", "User-Agent": HEADERS["User-Agent"]
+    }, timeout=(8, 25))
+    response.raise_for_status()
+    data = response.json()
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(str(data["error"])[:180])
+    return data
+
+
+def _walk_dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_dicts(child)
+
+
+def _halogen_nav_records(data, fund_name):
+    """Tolerantly parse the official API's dated NAV rows; reject undated values."""
+    out = []
+    for obj in _walk_dicts(data):
+        lower = {str(k).casefold(): v for k, v in obj.items()}
+        date_value = next((lower[k] for k in ("date", "navdate", "createdat", "pricedate", "effectiveat") if k in lower), None)
+        nav_value = next((lower[k] for k in ("netassetvalueperunit", "nav", "navperunit", "unitprice", "price") if k in lower), None)
+        if date_value is None or nav_value is None:
+            continue
+        try:
+            if isinstance(date_value, (int, float)):
+                dt = datetime.fromtimestamp(date_value / (1000 if date_value > 10**11 else 1), tz=timezone.utc).date().isoformat()
+            else:
+                raw = str(date_value).replace("Z", "+00:00")
+                try: dt = datetime.fromisoformat(raw).date().isoformat()
+                except ValueError: dt = parse_date(raw)
+            nav = float(str(nav_value).replace(",", ""))
+            if dt and 0.000001 <= nav <= 10000:
+                out.append({"date": dt, "nav": nav, "source": "Halogen Capital API", "fund": fund_name})
+        except (TypeError, ValueError, OverflowError):
+            continue
+    unique = {x["date"]: x for x in out}
+    return sorted(unique.values(), key=lambda x: x["date"])
+
+
+def fetch_halogen_daily():
+    body = _halogen_post("list_daily_fund_prices", {})
+    rows = []
+    for obj in _walk_dicts(body):
+        candidate = obj.get("dailyFundPrices")
+        if isinstance(candidate, list):
+            rows = candidate
+            break
+    by_id = {str(row.get("id")): row for row in rows if isinstance(row, dict)}
+    results = {}
+    for name, fund_id in HALOGEN_FUNDS.items():
+        row = by_id.get(fund_id)
+        if not row:
+            continue
+        nav = row.get("netAssetValuePerUnit")
+        created = row.get("createdAt") or row.get("date")
+        try:
+            price = float(nav)
+            date = datetime.fromisoformat(str(created).replace("Z", "+00:00")).date().isoformat()
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            results[name] = {"name": name, "nav": price, "date": date, "source": "Halogen Capital API"}
+    return results
+
+
+def fetch_halogen_history(fund_name):
+    fund_id = HALOGEN_FUNDS.get(fund_name)
+    if not fund_id:
+        raise ValueError("Unknown Halogen fund")
+    body = _halogen_post("list_fund_net_asset_value", {"fundId": fund_id, "fundClassSequence": 1, "timeframe": "all"})
+    points = _halogen_nav_records(body, fund_name)
+    if not points:
+        raise RuntimeError("Halogen history API response did not contain recognised dated NAV records; no estimates were used.")
+    return points
+
+
 def refresh_payload():
     prices, errors, statuses = {}, [], {}
     try:
@@ -610,29 +703,15 @@ def refresh_payload():
         statuses["Kenanga Investors"] = {"matched": 0, "expected": len(KENANGA_MAPPING)}
         errors.append("Kenanga source: " + str(exc)[:250])
 
-    halogen_primary = {}
     try:
-        halogen_primary = extract_halogen(request_html(HALOGEN_SOURCE))
+        halogen_primary = fetch_halogen_daily()
         prices.update(halogen_primary)
-        statuses["Halogen Capital"] = {"matched": len(halogen_primary), "expected": len(HALOGEN_MAPPING)}
+        statuses["Halogen Capital API"] = {"matched": len(halogen_primary), "expected": len(HALOGEN_MAPPING)}
+        if len(halogen_primary) < len(HALOGEN_MAPPING):
+            errors.append("Halogen API returned only some selected fund prices.")
     except Exception as exc:
-        statuses["Halogen Capital"] = {"matched": 0, "expected": len(HALOGEN_MAPPING)}
-        errors.append("Halogen source: " + str(exc)[:250])
-
-    halogen_missing = [name for name in HALOGEN_MAPPING if name not in prices]
-    if halogen_missing:
-        try:
-            fallback = extract_halogen_kenwealth_fallback(request_html(HALOGEN_FALLBACK_SOURCE))
-            for name, record in fallback.items():
-                if name not in prices:
-                    prices[name] = record
-            statuses["Kenanga KenWealth Halogen fallback"] = {
-                "matched": len(fallback), "expected": len(HALOGEN_MAPPING),
-                "used_for": [name for name in fallback if name not in halogen_primary],
-            }
-        except Exception as exc:
-            statuses["Kenanga KenWealth Halogen fallback"] = {"matched": 0, "expected": len(HALOGEN_MAPPING)}
-            errors.append("KenWealth Halogen fallback: " + str(exc)[:250])
+        statuses["Halogen Capital API"] = {"matched": 0, "expected": len(HALOGEN_MAPPING)}
+        errors.append("Halogen API: " + str(exc)[:250])
 
     missing = [name for name in ALL_FUNDS if name not in prices]
     if missing:
@@ -640,8 +719,7 @@ def refresh_payload():
     return {
         "source": {
             "Kenanga Investors": KENANGA_SOURCE,
-            "Halogen Capital": HALOGEN_SOURCE,
-            "Kenanga KenWealth Halogen fallback": HALOGEN_FALLBACK_SOURCE,
+            "Halogen Capital API": HALOGEN_API,
         },
         "sources": statuses,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -701,14 +779,26 @@ def api_nav_history():
         return value
     from_date, end_date = to_ddmmyyyy(from_value), to_ddmmyyyy(to_value)
     try:
-        result = fetch_kenanga_nav_history(fund_name, from_date, end_date)
-        # Chronological points for the performance chart.
-        result["points"] = [
-            {"date": row["date"], "nav": row["nav"], "source": row["source"]}
-            for row in sorted(result["data"], key=lambda item: item["date"])
-        ]
-        result["source_note"] = "Kenanga Investors · official historical NAV"
-        return jsonify(result)
+        if fund_name in HALOGEN_FUNDS:
+            points = fetch_halogen_history(fund_name)
+            from_iso = datetime.strptime(from_date, "%d-%m-%Y").date().isoformat() if from_date else "0001-01-01"
+            to_iso = datetime.strptime(end_date, "%d-%m-%Y").date().isoformat() if end_date else "9999-12-31"
+            points = [x for x in points if from_iso <= x["date"] <= to_iso]
+            return jsonify({"fund": fund_name, "points": points, "records_returned": len(points), "source_note": "Halogen Capital · official historical NAV API"})
+        start_dt = datetime.strptime(from_date, "%d-%m-%Y").date()
+        end_dt = datetime.strptime(end_date, "%d-%m-%Y").date()
+        if end_dt < start_dt:
+            return jsonify({"error": "End date must be on or after start date."}), 400
+        all_data = []
+        for year in range(start_dt.year, end_dt.year + 1):
+            chunk_start = max(start_dt, datetime(year, 1, 1).date()).strftime("%d-%m-%Y")
+            chunk_end = min(end_dt, datetime(year, 12, 31).date()).strftime("%d-%m-%Y")
+            chunk = fetch_kenanga_nav_history(fund_name, chunk_start, chunk_end)
+            all_data.extend(chunk.get("data", []))
+        points = [{"date": row["date"], "nav": row["nav"], "source": row["source"]}
+                  for row in sorted(all_data, key=lambda item: item["date"])]
+        return jsonify({"fund": fund_name, "points": points, "records_returned": len(points),
+                        "source_note": "Kenanga Investors · official historical NAV (year-by-year requests)"})
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except requests.RequestException as exc:
@@ -845,8 +935,18 @@ def api_get_extremes():
     """Return pre-saved ATH/ATL values from Supabase; no scan is performed."""
     try:
         rows = _get_all_extremes()
-        return jsonify({"funds": {row["fund_name"]: _extreme_row(row) for row in rows},
-                        "storage": "supabase"})
+        funds = {row["fund_name"]: _extreme_row(row) for row in rows}
+        for name in HALOGEN_FUNDS:
+            try:
+                points = fetch_halogen_history(name)
+                high = max(points, key=lambda x: x["nav"])
+                low = min(points, key=lambda x: x["nav"])
+                funds[name] = {"fund": name, "high": {"nav": high["nav"], "date": high["date"]},
+                               "low": {"nav": low["nav"], "date": low["date"]}, "complete": True,
+                               "lastChecked": datetime.now(timezone.utc).date().isoformat(), "recordsScanned": len(points)}
+            except Exception as exc:
+                funds[name] = {"fund": name, "high": None, "low": None, "error": str(exc)[:180]}
+        return jsonify({"funds": funds, "storage": "supabase + live Halogen API"})
     except Exception as exc:
         return jsonify({"error": str(exc)[:300], "funds": {}, "storage": "supabase"}), 503
 
