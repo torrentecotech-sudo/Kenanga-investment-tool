@@ -210,9 +210,24 @@ def extract_halogen_kenwealth_fallback(html):
 
 # Historical NAV endpoint discovered from Kenanga Investors browser Network capture.
 KENANGA_NAV_HISTORY_URL = "https://www.kenangainvestors.com.my/fund/fund/ajax-get-fund-nav-list"
+# All 15 IDs were confirmed by the bulk discovery result using a unique
+# latest NAV date + price match against Kenanga's official fund list.
 KENANGA_FUND_IDS = {
     "Kenanga Growth Fund": 49,
     "Kenanga Syariah Growth Fund": 30,
+    "Kenanga Shariah Growth Opportunities Fund": 29,
+    "Kenanga Blue Chip Fund": 1,
+    "Kenanga Premier Fund": 5,
+    "Kenanga Islamic Balanced Fund": 24,
+    "Kenanga Managed Growth Fund": 14,
+    "Kenanga Growth Fund Series 2 (MYR)": 50,
+    "Kenanga SyariahEXTRA Fund": 28,
+    "Kenanga Malaysian Inc Fund": 53,
+    "Kenanga Islamic Asia Pacific (ex Japan) Total Return Fund": 70,
+    "Kenanga Global Islamic Fund": 41,
+    "Kenanga ASnitaBOND Fund": 22,
+    "Kenanga Alternative Series: Global Real Assets Fund": 75,
+    "Kenanga Shariah US Titans 50 Fund": 77,
 }
 
 
@@ -575,6 +590,63 @@ def api_nav_history():
         return jsonify({"error": "Kenanga request failed: " + str(exc)[:200]}), 502
     except Exception as exc:
         return jsonify({"error": str(exc)[:250]}), 502
+
+
+@app.get("/api/nav/history/check-all")
+def api_check_all_kenanga_history():
+    """Check full available historical NAV coverage for every verified Kenanga fund.
+
+    Returns only a compact summary (not all NAV rows). This is an operational
+    validation endpoint and can take some time because it paginates each fund's
+    official history from inception-range start through today's date.
+    """
+    from_date = request.args.get("from_date", "01-01-1900")
+    end_date = request.args.get("end_date", datetime.now().strftime("%d-%m-%Y"))
+    results = []
+
+    def check_one(fund_name):
+        try:
+            result = fetch_kenanga_nav_history(
+                fund_name, from_date, end_date, page_size=100
+            )
+            rows = result.get("data", [])
+            dates = [row["date"] for row in rows if row.get("date")]
+            return {
+                "fund": fund_name,
+                "fund_id": result["fund_id"],
+                "status": "history_available" if rows else "no_records_in_range",
+                "records_total": result.get("records_total", 0),
+                "records_returned": len(rows),
+                "first_nav_date": min(dates) if dates else None,
+                "latest_nav_date": max(dates) if dates else None,
+                "latest_nav": next((row["nav"] for row in sorted(rows, key=lambda x: x["date"], reverse=True)), None),
+            }
+        except Exception as exc:
+            return {
+                "fund": fund_name,
+                "fund_id": KENANGA_FUND_IDS.get(fund_name),
+                "status": "error",
+                "error": str(exc)[:220],
+            }
+
+    # Limit parallel load on Kenanga's official NAV endpoint.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(check_one, name): name for name in KENANGA_MAPPING}
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    results.sort(key=lambda item: list(KENANGA_MAPPING).index(item["fund"]))
+    available = sum(1 for item in results if item["status"] == "history_available")
+    return jsonify({
+        "source": KENANGA_NAV_HISTORY_URL,
+        "from_date": from_date,
+        "end_date": end_date,
+        "verified_fund_ids": len(KENANGA_FUND_IDS),
+        "history_available": available,
+        "total_funds": len(KENANGA_MAPPING),
+        "funds": results,
+        "note": "A fund is marked history_available only when dated NAV rows are returned by the official Kenanga historical NAV endpoint.",
+    })
 
 
 @app.get("/health")
