@@ -27,12 +27,12 @@ table{width:100%;border-collapse:collapse;background:#fff;font-size:13px}th,td{t
 <div class="stat"><small>Latest NAV Date</small><strong style="font-size:19px">16 Nov 2026</strong></div>
 <div class="stat"><small>Price Source</small><strong style="font-size:17px">Kenanga</strong></div>
 </div>
-<div class="sectionhead"><div><h2>Selected Funds</h2><div class="note">Reference NAVs are dated per fund. Load ATH / ATL to scan the earliest historical NAV available from Kenanga, year by year.</div></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn gold" id="refreshNav">↻ Refresh NAV</button><button class="btn secondary" id="loadFundExtremes">Calculate All-Time ATH / ATL</button><button class="btn secondary" id="resetPrices">Reset NAV</button><a class="btn" href="https://www.kenangainvestors.com.my/fund-list" target="_blank" rel="noopener" style="text-decoration:none">Open Kenanga NAV ↗</a><a class="btn secondary" href="https://www.halogen.my/fund/price" target="_blank" rel="noopener" style="text-decoration:none">Open Halogen Prices ↗</a></div></div>
+<div class="sectionhead"><div><h2>Selected Funds</h2><div class="note">Reference NAVs are dated per fund. ATH / ATL values are saved on the server and load immediately. Run the server-side bulk scan once. Render saves each completed year and resumes after interruptions.</div></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn gold" id="refreshNav">↻ Refresh NAV</button><button class="btn secondary" id="loadFundExtremes">Scan / Update ATH / ATL</button><button class="btn secondary" id="resetPrices">Reset NAV</button><a class="btn" href="https://www.kenangainvestors.com.my/fund-list" target="_blank" rel="noopener" style="text-decoration:none">Open Kenanga NAV ↗</a><a class="btn secondary" href="https://www.halogen.my/fund/price" target="_blank" rel="noopener" style="text-decoration:none">Open Halogen Prices ↗</a></div></div>
 <div class="fields two" style="margin-bottom:12px"><div class="field"><label>Search funds</label><input id="searchFund" placeholder="Search fund name…"></div><div class="field"><label>Update NAV manually (select a fund)</label><select id="editFund"></select></div></div>
 <div class="fields two" style="margin-bottom:14px"><div class="field"><label>NAV (RM)</label><input id="editNav" type="number" min="0" step="0.0001" placeholder="e.g. 1.2345"></div><div class="field"><label>NAV Date</label><input id="editDate" type="date"></div></div>
 <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap"><button class="btn" id="saveNav">Save NAV</button><label class="btn secondary" style="cursor:pointer">Import CSV <input id="csvFile" type="file" accept=".csv,text/csv" hidden></label><button class="btn secondary" id="exportCsv">Export CSV</button></div>
-<div id="syncStatus" class="note" role="status" aria-live="polite">Click Refresh NAV for latest published prices. Select Calculate All-Time ATH / ATL to scan each Kenanga fund's historical NAV year by year. Halogen history is not yet connected.</div><div class="tablewrap"><table><thead><tr><th>Fund</th><th class="num">NAV (RM)</th><th>NAV Date</th><th>Source</th><th class="num">ATH (RM)</th><th>ATH Date</th><th class="num">ATL (RM)</th><th>ATL Date</th></tr></thead><tbody id="fundRows"></tbody></table></div>
-<div class="note">ATH/ATL dates are displayed in separate columns. Kenanga history is scanned year by year from 1980 onward, so the result covers the earliest dated records the official service returns. Halogen remains unavailable until its dated history source is connected.</div>
+<div id="syncStatus" class="note" role="status" aria-live="polite">Click Refresh NAV for latest published prices. Select Scan / Update ATH / ATL to scan each Kenanga fund's historical NAV year by year. Halogen history is not yet connected.</div><div class="tablewrap"><table><thead><tr><th>Fund</th><th class="num">NAV (RM)</th><th>NAV Date</th><th>Source</th><th class="num">ATH (RM)</th><th>ATH Date</th><th class="num">ATL (RM)</th><th>ATL Date</th></tr></thead><tbody id="fundRows"></tbody></table></div>
+<div class="note">ATH/ATL prices and dates are read from the server database. The bulk scan runs on Render for all verified Kenanga funds, starting in 1980 and saving each completed year. Attach a persistent Render disk so saved records survive redeploys and restarts. Halogen history is not connected yet.</div>
 </section>
 <section id="performance" class="panel">
  <div class="sectionhead"><div><h2>NAV Performance</h2><div class="note">Compare historical NAV price and percentage return for a selected fund and period.</div></div></div>
@@ -115,7 +115,7 @@ const fmt=(n,d=2)=>Number(n||0).toLocaleString("en-MY",{minimumFractionDigits:d,
 const money=n=>"RM"+fmt(n,2);const $=id=>document.getElementById(id);
 function persist(){localStorage.setItem(KEY,JSON.stringify(funds))}
 function options(){return funds.map(f=>`<option>${f.name}</option>`).join("")}
-const EXTREMES_KEY="kenanga-nav-extremes-v1";let fundExtremes=JSON.parse(localStorage.getItem(EXTREMES_KEY)||"{}");
+let fundExtremes={};async function loadSavedExtremes(){try{const r=await fetch("/api/nav/extremes",{cache:"no-store"});const d=await r.json();if(r.ok){fundExtremes=d.funds||{};renderFunds();}}catch(e){console.warn("Could not load saved ATH/ATL",e);}}
 function extremeCell(x,kind){if(!x)return "<span class=\"muted\">Not loaded</span>";if(x.error)return "<span class=\"muted\">Unavailable</span>";const v=kind==="high"?x.high:x.low;return v?`<strong>${fmt(v.nav,4)}</strong><br><small class=\"muted\">${v.date}</small>`:"—"}
 function renderFunds(){let q=$("searchFund").value.toLowerCase();$("fundRows").innerHTML=funds.filter(f=>f.name.toLowerCase().includes(q)).map(f=>{const x=fundExtremes[f.name];const high=x?.high,low=x?.low;return `<tr><td>${f.name}</td><td class="num">${f.nav==null?"—":fmt(f.nav,4)}</td><td>${f.date||"—"}</td><td>${f.source||(f.name.startsWith("Halogen")?"Halogen Capital":"Kenanga Investors")}</td><td class="num">${high?fmt(high.nav,4):"—"}</td><td>${high?.date||"—"}</td><td class="num">${low?fmt(low.nav,4):"—"}</td><td>${low?.date||"—"}</td></tr>`}).join("");$("fundCount").textContent=funds.length;$("availableCount").textContent=funds.filter(f=>f.nav!=null).length}
 function setupSelects(){let old=$("editFund").value,old2=$("calcFund").value;$("editFund").innerHTML=options();$("calcFund").innerHTML=options();if(funds.some(f=>f.name===old))$("editFund").value=old;if(funds.some(f=>f.name===old2))$("calcFund").value=old2;loadEdit()}
@@ -133,26 +133,28 @@ function calculate(){let sr=Math.max(0,Number($("serviceRate").value)||0)/100,ss
 $("addTx").onclick=()=>{tx.push({amount:"",nav:"",hasCharge:true});renderTx();calculate()};["currentNav","serviceRate","sstRate"].forEach(id=>$(id).oninput=calculate);$("calcFund").onchange=()=>{let f=funds.find(x=>x.name===$("calcFund").value);$("currentNav").value=f?.nav??"";calculate()};
 
 async function loadAllFundExtremes(){
- const btn=$("loadFundExtremes"),status=$("syncStatus");btn.disabled=true;
- const kenanga=funds.filter(f=>!f.name.startsWith("Halogen"));let completed=0,failed=[];
+ const btn=$("loadFundExtremes"),status=$("syncStatus");btn.disabled=true;btn.textContent="Starting scan…";
  try{
-  for(const f of kenanga){
-   let state=fundExtremes[f.name]||{nextYear:1980,high:null,low:null};
-   // Resume from the last completed year if a previous scan was interrupted.
-   for(let year=state.nextYear??1980;year<=new Date().getFullYear();year++){
-    status.textContent=`Scanning ${f.name}: historical year ${year} · fund ${completed+1}/${kenanga.length}`;
-    const q=new URLSearchParams({fund:f.name,year:String(year)});
-    const r=await fetch("/api/nav/history/year?"+q.toString(),{cache:"no-store"});const d=await r.json();
-    if(!r.ok)throw new Error(`${f.name} ${year}: ${d.error||r.status}`);
-    for(const point of (d.points||[])){if(!state.high||point.nav>state.high.nav)state.high=point;if(!state.low||point.nav<state.low.nav)state.low=point;}
-    state.nextYear=year+1;fundExtremes[f.name]=state;localStorage.setItem(EXTREMES_KEY,JSON.stringify(fundExtremes));renderFunds();
-    await new Promise(resolve=>setTimeout(resolve,100));
+  const start=await fetch("/api/nav/extremes/bulk-start",{method:"POST"});const started=await start.json();
+  if(!start.ok)throw new Error(started.error||"Could not start server-side scan.");
+  status.textContent="Bulk historical scan is running on Render. You can leave this page open or return later; completed years are saved on the server.";
+  let keepPolling=true;
+  while(keepPolling){
+   await new Promise(resolve=>setTimeout(resolve,2500));
+   const r=await fetch("/api/nav/extremes/bulk-status",{cache:"no-store"});const d=await r.json();
+   if(!r.ok)throw new Error(d.error||"Could not read scan progress.");
+   fundExtremes=d.funds||{};renderFunds();
+   const j=d.job||{};
+   if(j.status==="completed"){
+    status.textContent=`Completed: ${j.completed_funds}/${j.total_funds} Kenanga funds · ${j.completed_years} yearly chunks saved. ATH/ATL will load instantly next time.`;keepPolling=false;
+   }else if(j.status==="paused"){
+    status.textContent=j.message||"Scan paused. Press Scan / Update ATH / ATL to resume.";keepPolling=false;
+   }else{
+    status.textContent=`${j.message||"Historical scan running…"} · ${j.completed_funds||0}/${j.total_funds||15} funds · ${j.completed_years||0} yearly chunks saved`;
    }
-   state.complete=true;state.coverage="Earliest dated history returned by Kenanga from 1980 onward";fundExtremes[f.name]=state;localStorage.setItem(EXTREMES_KEY,JSON.stringify(fundExtremes));completed++;
   }
-  status.textContent=`Historical scan completed for ${completed} Kenanga funds. ATH/ATL dates are included. Halogen history is not connected yet.`;
- }catch(e){status.textContent="Scan paused: "+e.message+". Completed years are saved on this device; press Calculate All-Time ATH / ATL again to resume.";}
- finally{btn.disabled=false;renderFunds();}
+ }catch(e){status.textContent="Bulk scan issue: "+e.message+". Any completed years remain saved on the server.";}
+ finally{btn.disabled=false;btn.textContent="Scan / Update ATH / ATL";loadSavedExtremes();}
 }
 $("loadFundExtremes").onclick=loadAllFundExtremes;
 
@@ -175,5 +177,5 @@ function drawPerformance(points,extremes){if(!points||points.length<2){clearPerf
 async function loadPerformance(){const fund=$("performanceFund").value,from=$("performanceFrom").value,to=$("performanceTo").value;if(!fund||!from||!to||from>to){$("performanceStatus").textContent="Please choose a valid fund and date range.";return;}$("loadPerformance").disabled=true;$("performanceStatus").textContent="Retrieving selected-period NAV history…";try{const q=new URLSearchParams({fund,from,to});const res=await fetch("/api/nav/history?"+q.toString(),{cache:"no-store"});const data=await res.json();if(!res.ok)throw new Error(data.error||"Historical NAV is not available yet.");const selected=data.points||[];drawPerformance(selected);$("performanceStatus").textContent=`${selected.length.toLocaleString()} dated NAV records · ${data.source_note||"Source data"}`;}catch(e){clearPerformance("Historical data connection is not ready: "+e.message+". No sample or estimated prices are shown.");}finally{$("loadPerformance").disabled=false;}}
 $("prevPage").onclick=()=>{performancePage--;renderPerformancePage();};$("nextPage").onclick=()=>{performancePage++;renderPerformancePage();};
 $("loadPerformance").onclick=loadPerformance;document.querySelectorAll(".period-btn").forEach(b=>b.onclick=()=>{const d=new Date(),days=Number(b.dataset.days);if(days===0)d.setMonth(0,1);else d.setDate(d.getDate()-days);$("performanceFrom").value=d.toISOString().slice(0,10);$("performanceTo").value=new Date().toISOString().slice(0,10);});
-setupSelects();setupPerformance();renderFunds();$("currentNav").value=funds.find(f=>f.name===$("calcFund").value)?.nav??"";renderTx();calculate();
+setupSelects();setupPerformance();renderFunds();loadSavedExtremes();$("currentNav").value=funds.find(f=>f.name===$("calcFund").value)?.nav??"";renderTx();calculate();
 </script></body></html>
