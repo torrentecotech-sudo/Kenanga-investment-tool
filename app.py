@@ -6,6 +6,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import local, Thread, Lock
 import time
+import secrets
 
 import requests
 from bs4 import BeautifulSoup
@@ -38,17 +39,16 @@ KENANGA_MAPPING = {
 }
 
 HALOGEN_MAPPING = {
-    "Halogen Shariah Bitcoin Fund": ["Halogen Shariah Bitcoin Fund"],
+    "Halogen Shariah Bitcoin Fund": ["Halogen Shariah Bitcoin Fund", "Halogen Shariah Bitcoin Fund (MYR)"],
     "Halogen Shariah Crypto Titans Fund": ["Halogen Shariah Crypto Titans Fund", "HALOGEN SHARIAH CRYPTO TITANS FUND"],
     "Halogen Shariah Ethereum Fund": ["Halogen Shariah Ethereum Fund", "HALOGEN SHARIAH ETHERIUM FUND"],
 }
-HALOGEN_API = "https://api2.halogen.my/query"
-HALOGEN_FUNDS = {
+HALOGEN_API_URL = "https://api2.halogen.my/query"
+HALOGEN_API_FUNDS = {
     "Halogen Shariah Bitcoin Fund": "1d3ede3d8023fb76a6b73ab2972bdc28b73cc549",
     "Halogen Shariah Crypto Titans Fund": "36b15668cad57d279c63f4529af0c527603f9983",
     "Halogen Shariah Ethereum Fund": "bab842d7c4e6187ea42f6fa0d7a0d302aecbf6ad",
 }
-
 ALL_FUNDS = list(KENANGA_MAPPING) + list(HALOGEN_MAPPING)
 
 
@@ -341,6 +341,79 @@ def extract_halogen_kenwealth_fallback(html):
 
 
 
+def _halogen_post(name, payload=None):
+    headers = {"Content-Type": "application/json", "Origin": "https://halogen.my", "Referer": "https://halogen.my/", "User-Agent": HEADERS["User-Agent"]}
+    body = {"name": name, "payloadJSON": json.dumps(payload or {}, separators=(",", ":"))}
+    response = requests.post(HALOGEN_API_URL, json=body, headers=headers, timeout=(8, 25))
+    response.raise_for_status()
+    data = response.json()
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(str(data["error"])[:200])
+    return data
+
+
+def _walk_objects(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_objects(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_objects(child)
+
+
+def _halogen_date(value):
+    if value is None: return None
+    if isinstance(value, (int, float)):
+        # API timestamps may be seconds or milliseconds.
+        stamp = value / 1000 if value > 10**11 else value
+        try: return datetime.fromtimestamp(stamp, timezone.utc).date().isoformat()
+        except Exception: return None
+    return parse_date(str(value)[:10]) or parse_date(str(value))
+
+
+def _halogen_nav(value):
+    try:
+        n = float(str(value).replace(",", ""))
+        return n if 0.000001 <= n <= 100000 else None
+    except (TypeError, ValueError): return None
+
+
+def fetch_halogen_history(fund_name):
+    fund_id = HALOGEN_API_FUNDS[fund_name]
+    raw = _halogen_post("list_fund_net_asset_value", {"fundId": fund_id, "fundClassSequence": 1, "timeframe": "all"})
+    points, seen = [], set()
+    date_keys = ("date", "createdAt", "navDate", "priceDate", "effectiveDate", "timestamp", "asOf")
+    nav_keys = ("netAssetValuePerUnit", "nav", "value", "price", "unitPrice", "netAssetValue", "navPerUnit")
+    for obj in _walk_objects(raw):
+        low = {str(k).lower(): v for k, v in obj.items()}
+        date_value = next((low[k.lower()] for k in date_keys if k.lower() in low), None)
+        nav_value = next((low[k.lower()] for k in nav_keys if k.lower() in low), None)
+        date, nav = _halogen_date(date_value), _halogen_nav(nav_value)
+        if date and nav is not None and (date, nav) not in seen:
+            seen.add((date, nav)); points.append({"date": date, "nav": nav, "source": "Halogen Capital API"})
+    points.sort(key=lambda x: x["date"])
+    if not points:
+        raise RuntimeError("Halogen history API response returned no recognised dated NAV records")
+    return points
+
+
+def fetch_halogen_daily():
+    raw = _halogen_post("list_daily_fund_prices", {})
+    rows = raw.get("dailyFundPrices", []) if isinstance(raw, dict) else []
+    by_id = {v: k for k, v in HALOGEN_API_FUNDS.items()}
+    result = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict): continue
+        name = by_id.get(str(row.get("id", "")))
+        if not name: continue
+        nav = _halogen_nav(row.get("netAssetValuePerUnit"))
+        date = _halogen_date(row.get("createdAt") or row.get("date"))
+        if nav is not None and date:
+            result[name] = {"name": name, "nav": nav, "date": date, "source": "Halogen Capital API"}
+    return result
+
+
 # Historical NAV endpoint discovered from Kenanga Investors browser Network capture.
 KENANGA_NAV_HISTORY_URL = "https://www.kenangainvestors.com.my/fund/fund/ajax-get-fund-nav-list"
 # All 15 IDs were confirmed by the bulk discovery result using a unique
@@ -606,130 +679,28 @@ def _kenanga_profile_url(href, fund_name):
     return absolute
 
 
-def _halogen_post(name, payload=None):
-    body = {"name": name, "payloadJSON": json.dumps(payload or {}, separators=(",", ":"))}
-    response = requests.post(HALOGEN_API, json=body, headers={
-        "Content-Type": "application/json", "Origin": "https://halogen.my",
-        "Referer": "https://halogen.my/", "User-Agent": HEADERS["User-Agent"]
-    }, timeout=(8, 25))
-    response.raise_for_status()
-    data = response.json()
-    if isinstance(data, dict) and data.get("error"):
-        raise RuntimeError(str(data["error"])[:180])
-    return data
-
-
-def _walk_dicts(value):
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from _walk_dicts(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _walk_dicts(child)
-
-
-def _halogen_nav_records(data, fund_name):
-    """Tolerantly parse the official API's dated NAV rows; reject undated values."""
-    out = []
-    for obj in _walk_dicts(data):
-        lower = {str(k).casefold(): v for k, v in obj.items()}
-        date_value = next((lower[k] for k in ("date", "navdate", "createdat", "pricedate", "effectiveat") if k in lower), None)
-        nav_value = next((lower[k] for k in ("netassetvalueperunit", "nav", "navperunit", "unitprice", "price") if k in lower), None)
-        if date_value is None or nav_value is None:
-            continue
-        try:
-            if isinstance(date_value, (int, float)):
-                dt = datetime.fromtimestamp(date_value / (1000 if date_value > 10**11 else 1), tz=timezone.utc).date().isoformat()
-            else:
-                raw = str(date_value).replace("Z", "+00:00")
-                try: dt = datetime.fromisoformat(raw).date().isoformat()
-                except ValueError: dt = parse_date(raw)
-            nav = float(str(nav_value).replace(",", ""))
-            if dt and 0.000001 <= nav <= 10000:
-                out.append({"date": dt, "nav": nav, "source": "Halogen Capital API", "fund": fund_name})
-        except (TypeError, ValueError, OverflowError):
-            continue
-    unique = {x["date"]: x for x in out}
-    return sorted(unique.values(), key=lambda x: x["date"])
-
-
-def fetch_halogen_daily():
-    body = _halogen_post("list_daily_fund_prices", {})
-    rows = []
-    for obj in _walk_dicts(body):
-        candidate = obj.get("dailyFundPrices")
-        if isinstance(candidate, list):
-            rows = candidate
-            break
-    by_id = {str(row.get("id")): row for row in rows if isinstance(row, dict)}
-    results = {}
-    for name, fund_id in HALOGEN_FUNDS.items():
-        row = by_id.get(fund_id)
-        if not row:
-            continue
-        nav = row.get("netAssetValuePerUnit")
-        created = row.get("createdAt") or row.get("date")
-        try:
-            price = float(nav)
-            date = datetime.fromisoformat(str(created).replace("Z", "+00:00")).date().isoformat()
-        except (TypeError, ValueError):
-            continue
-        if price > 0:
-            results[name] = {"name": name, "nav": price, "date": date, "source": "Halogen Capital API"}
-    return results
-
-
-def fetch_halogen_history(fund_name):
-    fund_id = HALOGEN_FUNDS.get(fund_name)
-    if not fund_id:
-        raise ValueError("Unknown Halogen fund")
-    body = _halogen_post("list_fund_net_asset_value", {"fundId": fund_id, "fundClassSequence": 1, "timeframe": "all"})
-    points = _halogen_nav_records(body, fund_name)
-    if not points:
-        raise RuntimeError("Halogen history API response did not contain recognised dated NAV records; no estimates were used.")
-    return points
-
-
 def refresh_payload():
     prices, errors, statuses = {}, [], {}
     try:
         kenanga = extract_kenanga(request_html(KENANGA_SOURCE))
         prices.update(kenanga)
         statuses["Kenanga Investors"] = {"matched": len(kenanga), "expected": len(KENANGA_MAPPING)}
-        if not kenanga:
-            errors.append("Kenanga page loaded but no selected dated NAV Price rows were recognised.")
     except Exception as exc:
         statuses["Kenanga Investors"] = {"matched": 0, "expected": len(KENANGA_MAPPING)}
         errors.append("Kenanga source: " + str(exc)[:250])
-
     try:
-        halogen_primary = fetch_halogen_daily()
-        prices.update(halogen_primary)
-        statuses["Halogen Capital API"] = {"matched": len(halogen_primary), "expected": len(HALOGEN_MAPPING)}
-        if len(halogen_primary) < len(HALOGEN_MAPPING):
-            errors.append("Halogen API returned only some selected fund prices.")
+        halogen = fetch_halogen_daily()
+        prices.update(halogen)
+        statuses["Halogen Capital API"] = {"matched": len(halogen), "expected": len(HALOGEN_MAPPING)}
     except Exception as exc:
         statuses["Halogen Capital API"] = {"matched": 0, "expected": len(HALOGEN_MAPPING)}
         errors.append("Halogen API: " + str(exc)[:250])
-
     missing = [name for name in ALL_FUNDS if name not in prices]
-    if missing:
-        errors.append("No dated official/fallback NAV found for: " + ", ".join(missing))
-    return {
-        "source": {
-            "Kenanga Investors": KENANGA_SOURCE,
-            "Halogen Capital API": HALOGEN_API,
-        },
-        "sources": statuses,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "funds": list(prices.values()),
-        "prices": list(prices.values()),
-        "missing": missing,
-        "error": "; ".join(errors) if errors else None,
-        "matched": len(prices),
-        "expected": len(ALL_FUNDS),
-    }
+    if missing: errors.append("No current dated NAV found for: " + ", ".join(missing))
+    return {"source": {"Kenanga Investors": KENANGA_SOURCE, "Halogen Capital API": HALOGEN_API_URL},
+            "sources": statuses, "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "funds": list(prices.values()), "prices": list(prices.values()), "missing": missing,
+            "error": "; ".join(errors) if errors else None, "matched": len(prices), "expected": len(ALL_FUNDS)}
 
 
 @app.get("/")
@@ -779,26 +750,20 @@ def api_nav_history():
         return value
     from_date, end_date = to_ddmmyyyy(from_value), to_ddmmyyyy(to_value)
     try:
-        if fund_name in HALOGEN_FUNDS:
-            points = fetch_halogen_history(fund_name)
-            from_iso = datetime.strptime(from_date, "%d-%m-%Y").date().isoformat() if from_date else "0001-01-01"
-            to_iso = datetime.strptime(end_date, "%d-%m-%Y").date().isoformat() if end_date else "9999-12-31"
-            points = [x for x in points if from_iso <= x["date"] <= to_iso]
-            return jsonify({"fund": fund_name, "points": points, "records_returned": len(points), "source_note": "Halogen Capital · official historical NAV API"})
-        start_dt = datetime.strptime(from_date, "%d-%m-%Y").date()
-        end_dt = datetime.strptime(end_date, "%d-%m-%Y").date()
-        if end_dt < start_dt:
-            return jsonify({"error": "End date must be on or after start date."}), 400
-        all_data = []
-        for year in range(start_dt.year, end_dt.year + 1):
-            chunk_start = max(start_dt, datetime(year, 1, 1).date()).strftime("%d-%m-%Y")
-            chunk_end = min(end_dt, datetime(year, 12, 31).date()).strftime("%d-%m-%Y")
-            chunk = fetch_kenanga_nav_history(fund_name, chunk_start, chunk_end)
-            all_data.extend(chunk.get("data", []))
-        points = [{"date": row["date"], "nav": row["nav"], "source": row["source"]}
-                  for row in sorted(all_data, key=lambda item: item["date"])]
-        return jsonify({"fund": fund_name, "points": points, "records_returned": len(points),
-                        "source_note": "Kenanga Investors · official historical NAV (year-by-year requests)"})
+        if fund_name in HALOGEN_API_FUNDS:
+            all_points = fetch_halogen_history(fund_name)
+            lo = datetime.strptime(from_value, "%Y-%m-%d").date() if re.fullmatch(r"\d{4}-\d{2}-\d{2}", from_value or "") else datetime.strptime(from_value, "%d-%m-%Y").date()
+            hi = datetime.strptime(to_value, "%Y-%m-%d").date() if re.fullmatch(r"\d{4}-\d{2}-\d{2}", to_value or "") else datetime.strptime(to_value, "%d-%m-%Y").date()
+            selected = [x for x in all_points if lo.isoformat() <= x["date"] <= hi.isoformat()]
+            return jsonify({"fund": fund_name, "points": selected, "records_returned": len(selected), "source_note": "Halogen Capital API · historical NAV"})
+        result = fetch_kenanga_nav_history(fund_name, from_date, end_date)
+        # Chronological points for the performance chart.
+        result["points"] = [
+            {"date": row["date"], "nav": row["nav"], "source": row["source"]}
+            for row in sorted(result["data"], key=lambda item: item["date"])
+        ]
+        result["source_note"] = "Kenanga Investors · official historical NAV"
+        return jsonify(result)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except requests.RequestException as exc:
@@ -807,6 +772,59 @@ def api_nav_history():
         return jsonify({"error": str(exc)[:250]}), 502
 
 
+
+
+@app.get("/api/nav/by-date")
+def api_nav_by_date():
+    fund = request.args.get("fund", "").strip()
+    day = request.args.get("date", "").strip()
+    if not fund or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        return jsonify({"error": "Choose a fund and valid date (YYYY-MM-DD)."}), 400
+    try:
+        if fund in HALOGEN_API_FUNDS:
+            points = fetch_halogen_history(fund)
+        elif fund in KENANGA_FUND_IDS:
+            d = datetime.strptime(day, "%Y-%m-%d").date()
+            prev = (d.replace(day=1) - __import__("datetime").timedelta(days=1))
+            start = prev.replace(day=1).strftime("%d-%m-%Y")
+            end = d.strftime("%d-%m-%Y")
+            points = [{"date": x["date"], "nav": x["nav"], "source": x["source"]} for x in fetch_kenanga_nav_history(fund, start, end).get("data", [])]
+        else:
+            return jsonify({"error": "Fund is not supported."}), 400
+        points = sorted([x for x in points if x["date"] <= day], key=lambda x: x["date"])
+        if not points: return jsonify({"error": "No published NAV found on or before this date."}), 404
+        current = points[-1]; previous = points[-2] if len(points) > 1 else None
+        change = (current["nav"] - previous["nav"]) if previous else None
+        pct = (change / previous["nav"] * 100) if previous and previous["nav"] else None
+        return jsonify({"fund": fund, "requested_date": day, "nav": current["nav"], "date": current["date"], "previous_nav": previous["nav"] if previous else None, "previous_date": previous["date"] if previous else None, "change": change, "change_pct": pct, "source": current.get("source", "Official NAV")})
+    except Exception as exc:
+        return jsonify({"error": str(exc)[:250]}), 502
+
+
+_EARLIEST_NAV_CACHE = {}
+@app.get("/api/nav/earliest")
+def api_nav_earliest():
+    fund = request.args.get("fund", "").strip()
+    if fund not in ALL_FUNDS: return jsonify({"error": "Unsupported fund."}), 400
+    if fund in _EARLIEST_NAV_CACHE: return jsonify(_EARLIEST_NAV_CACHE[fund])
+    try:
+        if fund in HALOGEN_API_FUNDS:
+            pts = fetch_halogen_history(fund)
+            result = {"fund": fund, "earliest_date": pts[0]["date"], "earliest_nav": pts[0]["nav"], "source": "Halogen Capital API history"}
+        else:
+            found = None
+            # Query bounded calendar-year chunks, stopping at the first year with records.
+            for year in range(1980, datetime.now().year + 1):
+                rows = fetch_kenanga_nav_history(fund, f"01-01-{year}", f"31-12-{year}", page_size=100).get("data", [])
+                if rows:
+                    first = min(rows, key=lambda x: x["date"])
+                    found = {"fund": fund, "earliest_date": first["date"], "earliest_nav": first["nav"], "source": "Kenanga Investors historical NAV"}
+                    break
+            if not found: return jsonify({"error": "No historical NAV records found."}), 404
+            result = found
+        _EARLIEST_NAV_CACHE[fund] = result
+        return jsonify(result)
+    except Exception as exc: return jsonify({"error": str(exc)[:240]}), 502
 
 @app.get("/api/nav/history/year")
 def api_nav_history_year():
@@ -935,18 +953,18 @@ def api_get_extremes():
     """Return pre-saved ATH/ATL values from Supabase; no scan is performed."""
     try:
         rows = _get_all_extremes()
-        funds = {row["fund_name"]: _extreme_row(row) for row in rows}
-        for name in HALOGEN_FUNDS:
+        result = {row["fund_name"]: _extreme_row(row) for row in rows}
+        for fund_name in HALOGEN_API_FUNDS:
             try:
-                points = fetch_halogen_history(name)
-                high = max(points, key=lambda x: x["nav"])
-                low = min(points, key=lambda x: x["nav"])
-                funds[name] = {"fund": name, "high": {"nav": high["nav"], "date": high["date"]},
-                               "low": {"nav": low["nav"], "date": low["date"]}, "complete": True,
-                               "lastChecked": datetime.now(timezone.utc).date().isoformat(), "recordsScanned": len(points)}
-            except Exception as exc:
-                funds[name] = {"fund": name, "high": None, "low": None, "error": str(exc)[:180]}
-        return jsonify({"funds": funds, "storage": "supabase + live Halogen API"})
+                pts = fetch_halogen_history(fund_name)
+                hi = max(pts, key=lambda x: x["nav"])
+                lo = min(pts, key=lambda x: x["nav"])
+                result[fund_name] = {"fund": fund_name, "high": {"nav": hi["nav"], "date": hi["date"]},
+                                     "low": {"nav": lo["nav"], "date": lo["date"]}, "complete": True,
+                                     "source": "Halogen Capital API history"}
+            except Exception as halogen_exc:
+                result[fund_name] = {"fund": fund_name, "error": str(halogen_exc)[:180]}
+        return jsonify({"funds": result, "storage": "supabase + live Halogen API"})
     except Exception as exc:
         return jsonify({"error": str(exc)[:300], "funds": {}, "storage": "supabase"}), 503
 
@@ -1063,6 +1081,141 @@ def api_bulk_extremes_status():
         return jsonify({"job": _bulk_job_state(), "funds": funds})
     except Exception as exc:
         return jsonify({"error": str(exc)[:300]}), 503
+
+
+# Monthly factsheet holdings automation. Supabase Cron calls /api/holdings/sync.
+HOLDINGS_SYNC_TOKEN = os.environ.get("HOLDINGS_SYNC_TOKEN", "")
+KENANGA_DOCUMENTS_URL = "https://www.kenangainvestors.com.my/fund-document-download"
+KNOWN_FACTSHEET_URLS = {'Kenanga Blue Chip Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/IBC%20FFS.pdf', 'Kenanga Global Islamic Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/KIF%20FFS.pdf', 'Kenanga Islamic Balanced Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/KIBF%20FFS.pdf', 'Kenanga Growth Fund Series 2 (MYR)': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/KGFS2MYR%20FFS.pdf', 'Kenanga Syariah Growth Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/KSGF%20FFS.pdf', 'Kenanga Managed Growth Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/IMG%20FFS.pdf', 'Kenanga Malaysian Inc Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/KMIF%20FFS.pdf', 'Kenanga Premier Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/PKOCF%20FFS.pdf'}
+
+@app.get("/api/holdings")
+def api_holdings():
+    """Return latest verified factsheet snapshot per fund."""
+    if not SUPABASE_READY:
+        return jsonify({"funds": {}, "configured": False, "note": "Supabase is not configured."})
+    try:
+        rows = _sb_get("fund_holdings_snapshots", {
+            "select": "fund_name,report_date,source_url,holdings,updated_at",
+            "order": "report_date.desc", "limit": "500"
+        })
+        latest = {}
+        for row in rows:
+            latest.setdefault(row["fund_name"], row)
+        return jsonify({"funds": latest, "configured": True})
+    except Exception as exc:
+        return jsonify({"funds": {}, "configured": True, "error": str(exc)[:300]}), 502
+
+
+def _extract_pdf_holdings(pdf_bytes):
+    """Extract labelled Top Equity/Fixed Income Holdings tables; reject unlabelled guesses."""
+    try:
+        from pypdf import PdfReader
+        import io
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages = "\n".join((p.extract_text() or "") for p in reader.pages)
+    except Exception as exc:
+        raise RuntimeError(f"PDF text extraction failed: {exc}")
+    text = re.sub(r"[ \t]+", " ", pages)
+    result = {"equity": [], "fixed": []}
+    # Parse rows after recognised table headings; only accept explicit percentage rows.
+    headings = [
+        ("equity", r"TOP\s+(?:5\s+)?EQUITY\s+HOLDINGS"),
+        ("fixed", r"TOP\s+(?:5\s+)?(?:FIXED\s+INCOME|BOND|SUKUK)\s+HOLDINGS"),
+    ]
+    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines() if x.strip()]
+    for kind, heading in headings:
+        active = False
+        for line in lines:
+            if re.search(heading, line, re.I):
+                active = True
+                continue
+            if active:
+                if re.search(r"TOP\s+.*HOLDINGS|SECTOR\s+ALLOCATION|ASSET\s+ALLOCATION", line, re.I):
+                    break
+                m = re.match(r"(.{3,100}?)\s+(\d{1,2}(?:\.\d{1,2})?)\s*%", line)
+                if m:
+                    name = m.group(1).strip(" -:|")
+                    pct = float(m.group(2))
+                    if name and pct <= 100 and not re.search(r"TOTAL|CASH|NAV", name, re.I):
+                        result[kind].append([name, pct])
+                        if len(result[kind]) >= 5:
+                            break
+    result["equity"] = result["equity"][:5]
+    result["fixed"] = result["fixed"][:5]
+    if not result["equity"] and not result["fixed"]:
+        raise RuntimeError("Recognised Top Holdings table not found; snapshot not replaced.")
+    return result
+
+
+def _discover_factsheet_links():
+    response = requests.get(KENANGA_DOCUMENTS_URL, headers=HEADERS, timeout=(8, 25))
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        label = " ".join([a.get_text(" ", strip=True), a.parent.get_text(" ", strip=True)])
+        full = requests.compat.urljoin(KENANGA_DOCUMENTS_URL, href)
+        if ".pdf" in full.lower() and re.search(r"fact.?sheet|ffs|monthly", label + " " + full, re.I):
+            links.append((full, label))
+    return links
+
+
+def _match_factsheet_fund(label, url):
+    hay = re.sub(r"[^a-z0-9]+", " ", (label + " " + url).lower())
+    matches = []
+    for fund in KENANGA_MAPPING:
+        key = re.sub(r"[^a-z0-9]+", " ", fund.lower()).strip()
+        if key and key in hay:
+            matches.append(fund)
+    return matches[0] if len(matches) == 1 else None
+
+
+@app.post("/api/holdings/sync")
+def api_holdings_sync():
+    """Monthly job: discover official factsheets, parse and append new report snapshots."""
+    if not HOLDINGS_SYNC_TOKEN:
+        return jsonify({"error": "HOLDINGS_SYNC_TOKEN is not configured."}), 503
+    supplied = request.headers.get("X-Holdings-Token", "")
+    if not secrets.compare_digest(supplied, HOLDINGS_SYNC_TOKEN):
+        return jsonify({"error": "Unauthorized"}), 401
+    if not SUPABASE_READY:
+        return jsonify({"error": "Supabase is not configured."}), 503
+    try:
+        _sb_get("fund_holdings_snapshots", {"select": "fund_name", "limit": "1"})
+    except Exception as exc:
+        return jsonify({"error": "Create fund_holdings_snapshots table using supabase/holdings_monthly_setup.sql", "detail": str(exc)[:250]}), 503
+    links = _discover_factsheet_links()
+    outcomes = []
+    for url, label in links:
+        fund = _match_factsheet_fund(label, url)
+        if not fund:
+            continue
+        try:
+            pdf = requests.get(url, headers=HEADERS, timeout=(8, 30))
+            pdf.raise_for_status()
+            holdings = _extract_pdf_holdings(pdf.content)
+            # Report date is read from the PDF itself; never substitute today's date.
+            from pypdf import PdfReader
+            import io
+            body = "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(pdf.content)).pages[:2])
+            date_match = re.search(r"\b(20\d{2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\b|\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\b", body, re.I)
+            if not date_match:
+                raise RuntimeError("Factsheet report month not found in first two PDF pages.")
+            month_text = " ".join(x for x in date_match.groups() if x)
+            try:
+                report_date = datetime.strptime(month_text.title(), "%Y %B").date().isoformat()
+            except ValueError:
+                report_date = datetime.strptime(month_text.title(), "%B %Y").date().isoformat()
+            payload = {"fund_name": fund, "report_date": report_date, "source_url": url,
+                       "holdings": holdings, "updated_at": datetime.now(timezone.utc).isoformat()}
+            _sb_upsert("fund_holdings_snapshots", payload, "fund_name,report_date")
+            outcomes.append({"fund": fund, "report_date": report_date, "status": "updated"})
+        except Exception as exc:
+            outcomes.append({"fund": fund, "status": "skipped", "reason": str(exc)[:220]})
+    return jsonify({"checked_links": len(links), "results": outcomes,
+                    "updated": sum(1 for x in outcomes if x["status"] == "updated")})
+
 
 @app.get("/health")
 def health():
