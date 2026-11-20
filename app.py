@@ -1148,27 +1148,76 @@ def _extract_pdf_holdings(pdf_bytes):
 
 
 def _discover_factsheet_links():
-    response = requests.get(KENANGA_DOCUMENTS_URL, headers=HEADERS, timeout=(8, 25))
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        label = " ".join([a.get_text(" ", strip=True), a.parent.get_text(" ", strip=True)])
-        full = requests.compat.urljoin(KENANGA_DOCUMENTS_URL, href)
-        if ".pdf" in full.lower() and re.search(r"fact.?sheet|ffs|monthly", label + " " + full, re.I):
-            links.append((full, label))
-    return links
+    """Discover current official PDFs and include known direct factsheet URLs as fallback."""
+    links_by_url = {}
+    try:
+        response = requests.get(KENANGA_DOCUMENTS_URL, headers=HEADERS, timeout=(8, 25))
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            label = " ".join([a.get_text(" ", strip=True), a.parent.get_text(" ", strip=True)])
+            full = requests.compat.urljoin(KENANGA_DOCUMENTS_URL, href)
+            if ".pdf" in full.lower() and re.search(r"fact.?sheet|ffs|monthly", label + " " + full, re.I):
+                links_by_url[full] = label or "Official factsheet listing"
+    except Exception:
+        # The official listing may be blocked or JavaScript-rendered on hosted servers.
+        # Known direct PDF links below provide a conservative fallback.
+        pass
+
+    for fund, url in KNOWN_FACTSHEET_URLS.items():
+        links_by_url.setdefault(url, fund)
+
+    return [(url, label) for url, label in links_by_url.items()]
 
 
 def _match_factsheet_fund(label, url):
-    hay = re.sub(r"[^a-z0-9]+", " ", (label + " " + url).lower())
+    # Direct URL-to-fund mapping is unambiguous for the known factsheet URLs.
+    for fund, known_url in KNOWN_FACTSHEET_URLS.items():
+        if url.rstrip("/") == known_url.rstrip("/"):
+            return fund
+
+    hay = re.sub(r"[^a-z0-9]+", " ", (label + " " + url).lower()).strip()
     matches = []
     for fund in KENANGA_MAPPING:
         key = re.sub(r"[^a-z0-9]+", " ", fund.lower()).strip()
-        if key and key in hay:
+        if key and re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])", hay):
             matches.append(fund)
     return matches[0] if len(matches) == 1 else None
+
+
+def _factsheet_report_date(pdf_bytes):
+    """Read an explicit report date/month from the first two PDF pages."""
+    try:
+        from pypdf import PdfReader
+        import io
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        body = "\n".join((page.extract_text() or "") for page in reader.pages[:2])
+    except Exception as exc:
+        raise RuntimeError(f"PDF report-date extraction failed: {exc}")
+
+    months = ("January|February|March|April|May|June|July|August|September|"
+              "October|November|December")
+    full_date = re.search(r"\b(\d{1,2})\s+(" + months + r")\s+(20\d{2})\b", body, re.I)
+    if full_date:
+        return datetime.strptime(
+            f"{full_date.group(1)} {full_date.group(2)} {full_date.group(3)}",
+            "%d %B %Y"
+        ).date().isoformat()
+
+    month_year = re.search(
+        r"\b(20\d{2})\s+(" + months + r")\b|\b(" + months + r")\s+(20\d{2})\b",
+        body, re.I
+    )
+    if not month_year:
+        raise RuntimeError("Factsheet report month not found in first two PDF pages.")
+    month_text = " ".join(part for part in month_year.groups() if part)
+    for fmt in ("%Y %B", "%B %Y"):
+        try:
+            return datetime.strptime(month_text.title(), fmt).date().isoformat()
+        except ValueError:
+            pass
+    raise RuntimeError("Factsheet report month could not be interpreted.")
 
 
 @app.post("/api/holdings/sync")
@@ -1185,8 +1234,13 @@ def api_holdings_sync():
         _sb_get("fund_holdings_snapshots", {"select": "fund_name", "limit": "1"})
     except Exception as exc:
         return jsonify({"error": "Create fund_holdings_snapshots table using supabase/holdings_monthly_setup.sql", "detail": str(exc)[:250]}), 503
-    links = _discover_factsheet_links()
+    try:
+        links = _discover_factsheet_links()
+    except Exception as exc:
+        return jsonify({"error": "Factsheet discovery failed", "detail": str(exc)[:250]}), 502
+
     outcomes = []
+    saved_reports = set()
     for url, label in links:
         fund = _match_factsheet_fund(label, url)
         if not fund:
@@ -1196,25 +1250,23 @@ def api_holdings_sync():
             pdf.raise_for_status()
             holdings = _extract_pdf_holdings(pdf.content)
             # Report date is read from the PDF itself; never substitute today's date.
-            from pypdf import PdfReader
-            import io
-            body = "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(pdf.content)).pages[:2])
-            date_match = re.search(r"\b(20\d{2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\b|\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\b", body, re.I)
-            if not date_match:
-                raise RuntimeError("Factsheet report month not found in first two PDF pages.")
-            month_text = " ".join(x for x in date_match.groups() if x)
-            try:
-                report_date = datetime.strptime(month_text.title(), "%Y %B").date().isoformat()
-            except ValueError:
-                report_date = datetime.strptime(month_text.title(), "%B %Y").date().isoformat()
+            report_date = _factsheet_report_date(pdf.content)
+            snapshot_key = (fund, report_date)
+            if snapshot_key in saved_reports:
+                continue
             payload = {"fund_name": fund, "report_date": report_date, "source_url": url,
                        "holdings": holdings, "updated_at": datetime.now(timezone.utc).isoformat()}
             _sb_upsert("fund_holdings_snapshots", payload, "fund_name,report_date")
-            outcomes.append({"fund": fund, "report_date": report_date, "status": "updated"})
+            saved_reports.add(snapshot_key)
+            outcomes.append({"fund": fund, "report_date": report_date, "status": "updated",
+                             "source_url": url})
         except Exception as exc:
-            outcomes.append({"fund": fund, "status": "skipped", "reason": str(exc)[:220]})
+            outcomes.append({"fund": fund, "status": "skipped", "source_url": url,
+                             "reason": str(exc)[:220]})
     return jsonify({"checked_links": len(links), "results": outcomes,
-                    "updated": sum(1 for x in outcomes if x["status"] == "updated")})
+                    "updated": sum(1 for x in outcomes if x["status"] == "updated"),
+                    "skipped": sum(1 for x in outcomes if x["status"] == "skipped"),
+                    "note": "Only dated, explicitly labelled holdings are saved. Existing snapshots remain if parsing fails."})
 
 
 @app.get("/health")

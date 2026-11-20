@@ -42,6 +42,18 @@ The dashboard embeds only holdings transcribed from identified Kenanga Investors
 - `GET /api/holdings` serves the latest Supabase snapshot for each fund.
 - `POST /api/holdings/sync` discovers Kenanga factsheet PDF links, extracts labelled Top Equity / Top Fixed Income Holdings, reads the report month from the PDF, and appends a dated snapshot. It does not replace prior snapshots if parsing fails.
 - `pypdf` is installed through requirements.
-- Set `HOLDINGS_SYNC_TOKEN` in Render Environment. Run `supabase/holdings_monthly_setup.sql` once in Supabase SQL Editor after replacing the Render URL and token placeholders. Existing `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are used server-side.
+- Set `HOLDINGS_SYNC_TOKEN` in Render Environment. Use the same token in `supabase/holdings_monthly_setup.sql`; the Render URL is already pre-filled as `https://kenanga-investment-tool.onrender.com`. Keep the real token out of public GitHub repositories. Existing `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are used server-side.
 - Supabase Cron calls the Render sync endpoint monthly on day 5 at 03:15 UTC. Monitor Supabase Cron job history and Render logs.
-- Kenanga's official Fund Documents page is the source. If the listing is rendered behind a consent/JS gate or a PDF layout changes, the run safely skips the unparsed file and retains the last valid snapshot. Halogen holdings require a separate official Halogen report source and are not inferred.
+- Kenanga's official Fund Documents page is checked first. Eight known direct factsheet PDF URLs are also used as a fallback if the listing is blocked or JavaScript-rendered. The sync reads the report date from the PDF (full date where printed, otherwise the first day of the stated month), and safely skips unparsed files while retaining the last valid snapshot. Halogen holdings require a separate official Halogen report source and are not inferred.
+
+
+## Render environment for monthly holdings
+Set these in Render → your Web Service → Environment:
+- `SUPABASE_URL` = your Supabase project URL
+- `SUPABASE_SERVICE_ROLE_KEY` = your Supabase service-role key (keep private)
+- `HOLDINGS_SYNC_TOKEN` = a long random secret; use exactly the same value in Supabase Vault as `kenanga_holdings_sync_token`
+
+The monthly job runs on the 5th of each month at 03:15 UTC (11:15 Malaysia time). The SQL script schedules the job and calls:
+`https://kenanga-investment-tool.onrender.com/api/holdings/sync`
+
+After deployment, test `GET /health`, then test the sync with a POST request carrying the `X-Holdings-Token` header. Do not share the token publicly.
