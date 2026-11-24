@@ -688,15 +688,44 @@ def refresh_payload():
     except Exception as exc:
         statuses["Kenanga Investors"] = {"matched": 0, "expected": len(KENANGA_MAPPING)}
         errors.append("Kenanga source: " + str(exc)[:250])
+
+    # Start with the official daily endpoint, then reconcile each of the three
+    # Halogen funds against its official all-history endpoint so a stale daily
+    # row cannot overwrite a newer published NAV.
+    halogen_errors = []
     try:
         halogen = fetch_halogen_daily()
         prices.update(halogen)
-        statuses["Halogen Capital API"] = {"matched": len(halogen), "expected": len(HALOGEN_MAPPING)}
     except Exception as exc:
-        statuses["Halogen Capital API"] = {"matched": 0, "expected": len(HALOGEN_MAPPING)}
-        errors.append("Halogen API: " + str(exc)[:250])
+        halogen_errors.append("daily endpoint: " + str(exc)[:160])
+        halogen = {}
+
+    history_matched = 0
+    for fund_name in HALOGEN_API_FUNDS:
+        try:
+            history = fetch_halogen_history(fund_name)
+            latest = max(history, key=lambda item: item["date"])
+            existing = prices.get(fund_name)
+            if existing is None or latest["date"] > existing.get("date", ""):
+                prices[fund_name] = {
+                    "name": fund_name, "nav": latest["nav"], "date": latest["date"],
+                    "source": "Halogen Capital API history"
+                }
+            history_matched += 1
+        except Exception as exc:
+            halogen_errors.append(f"{fund_name}: {str(exc)[:120]}")
+
+    statuses["Halogen Capital API"] = {
+        "matched": sum(1 for name in HALOGEN_MAPPING if name in prices),
+        "expected": len(HALOGEN_MAPPING),
+        "history_verified": history_matched
+    }
+    if halogen_errors:
+        errors.append("Halogen API: " + "; ".join(halogen_errors)[:250])
+
     missing = [name for name in ALL_FUNDS if name not in prices]
-    if missing: errors.append("No current dated NAV found for: " + ", ".join(missing))
+    if missing:
+        errors.append("No current dated NAV found for: " + ", ".join(missing))
     return {"source": {"Kenanga Investors": KENANGA_SOURCE, "Halogen Capital API": HALOGEN_API_URL},
             "sources": statuses, "fetched_at": datetime.now(timezone.utc).isoformat(),
             "funds": list(prices.values()), "prices": list(prices.values()), "missing": missing,
@@ -791,9 +820,13 @@ def api_nav_by_date():
             points = [{"date": x["date"], "nav": x["nav"], "source": x["source"]} for x in fetch_kenanga_nav_history(fund, start, end).get("data", [])]
         else:
             return jsonify({"error": "Fund is not supported."}), 400
-        points = sorted([x for x in points if x["date"] <= day], key=lambda x: x["date"])
-        if not points: return jsonify({"error": "No published NAV found on or before this date."}), 404
-        current = points[-1]; previous = points[-2] if len(points) > 1 else None
+        points = sorted(points, key=lambda x: x["date"])
+        exact = [x for x in points if x["date"] == day]
+        if not exact:
+            return jsonify({"error": "No NAV available for this exact date."}), 404
+        current = exact[-1]
+        earlier = [x for x in points if x["date"] < day]
+        previous = earlier[-1] if earlier else None
         change = (current["nav"] - previous["nav"]) if previous else None
         pct = (change / previous["nav"] * 100) if previous and previous["nav"] else None
         return jsonify({"fund": fund, "requested_date": day, "nav": current["nav"], "date": current["date"], "previous_nav": previous["nav"] if previous else None, "previous_date": previous["date"] if previous else None, "change": change, "change_pct": pct, "source": current.get("source", "Official NAV")})
