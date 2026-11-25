@@ -1362,20 +1362,25 @@ def _factsheet_report_date(pdf_bytes):
     raise RuntimeError("Factsheet report month could not be interpreted.")
 
 
+_HOLDINGS_LAST_SYNC_AT = None
+
 @app.post("/api/holdings/sync")
 def api_holdings_sync():
     """Monthly job: discover official factsheets, parse and append new report snapshots."""
-    if not HOLDINGS_SYNC_TOKEN:
-        return jsonify({"error": "HOLDINGS_SYNC_TOKEN is not configured."}), 503
-    supplied = request.headers.get("X-Holdings-Token", "")
-    if not secrets.compare_digest(supplied, HOLDINGS_SYNC_TOKEN):
-        return jsonify({"error": "Unauthorized"}), 401
+    # Browser users do not enter a secret. Server-side sync is throttled.
+    global _HOLDINGS_LAST_SYNC_AT
+    now_utc = datetime.now(timezone.utc)
+    if _HOLDINGS_LAST_SYNC_AT and (now_utc - _HOLDINGS_LAST_SYNC_AT).total_seconds() < 12 * 3600:
+        return jsonify({"updated": 0, "skipped": 0, "results": [],
+                        "note": "Automatic factsheet check already ran within the last 12 hours.",
+                        "cooldown": True}), 200
     if not SUPABASE_READY:
         return jsonify({"error": "Supabase is not configured."}), 503
     try:
         _sb_get("fund_holdings_snapshots", {"select": "fund_name", "limit": "1"})
     except Exception as exc:
         return jsonify({"error": "Create fund_holdings_snapshots table using supabase/holdings_monthly_setup.sql", "detail": str(exc)[:250]}), 503
+    _HOLDINGS_LAST_SYNC_AT = now_utc
     try:
         links = _discover_factsheet_links()
     except Exception as exc:
