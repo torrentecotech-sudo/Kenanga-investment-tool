@@ -774,15 +774,19 @@ def api_nav_history():
     from_value = request.args.get("from") or request.args.get("from_date", "")
     to_value = request.args.get("to") or request.args.get("end_date", "")
     def to_ddmmyyyy(value):
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value or ""):
-            return datetime.strptime(value, "%Y-%m-%d").strftime("%d-%m-%Y")
-        return value
+        value = (value or "").strip()
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d%m%Y"):
+            try:
+                return datetime.strptime(value, fmt).strftime("%d-%m-%Y")
+            except ValueError:
+                continue
+        raise ValueError("Dates must be YYYY-MM-DD or DD/MM/YYYY.")
     from_date, end_date = to_ddmmyyyy(from_value), to_ddmmyyyy(to_value)
     try:
         if fund_name in HALOGEN_API_FUNDS:
             all_points = fetch_halogen_history(fund_name)
-            lo = datetime.strptime(from_value, "%Y-%m-%d").date() if re.fullmatch(r"\d{4}-\d{2}-\d{2}", from_value or "") else datetime.strptime(from_value, "%d-%m-%Y").date()
-            hi = datetime.strptime(to_value, "%Y-%m-%d").date() if re.fullmatch(r"\d{4}-\d{2}-\d{2}", to_value or "") else datetime.strptime(to_value, "%d-%m-%Y").date()
+            lo = datetime.strptime(from_date, "%d-%m-%Y").date()
+            hi = datetime.strptime(end_date, "%d-%m-%Y").date()
             selected = [x for x in all_points if lo.isoformat() <= x["date"] <= hi.isoformat()]
             return jsonify({"fund": fund_name, "points": selected, "records_returned": len(selected), "source_note": "Halogen Capital API · historical NAV"})
         result = fetch_kenanga_nav_history(fund_name, from_date, end_date)
@@ -1140,64 +1144,159 @@ def api_holdings():
 
 
 def _extract_pdf_holdings(pdf_bytes):
-    """Extract labelled Top Equity/Fixed Income Holdings tables; reject unlabelled guesses."""
+    """Extract only the explicitly labelled Top Equity and Top Fixed Income tables."""
     try:
         from pypdf import PdfReader
         import io
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages = "\n".join((p.extract_text() or "") for p in reader.pages)
+        pages = "\n".join((page.extract_text() or "") for page in reader.pages)
     except Exception as exc:
         raise RuntimeError(f"PDF text extraction failed: {exc}")
-    text = re.sub(r"[ \t]+", " ", pages)
-    result = {"equity": [], "fixed": []}
-    # Parse rows after recognised table headings; only accept explicit percentage rows.
+
+    # Keep line boundaries: some factsheets place rank, holding and percentage
+    # in separate PDF text lines; others place the entire row on one line.
+    raw_lines = [re.sub(r"[ \t]+", " ", line).strip()
+                 for line in pages.replace("\r", "\n").splitlines()]
+    lines = [line for line in raw_lines if line]
     headings = [
-        ("equity", r"TOP\s+(?:5\s+)?EQUITY\s+HOLDINGS"),
-        ("fixed", r"TOP\s+(?:5\s+)?(?:FIXED\s+INCOME|BOND|SUKUK)\s+HOLDINGS"),
+        ("equity", re.compile(r"TOP\s+(?:5\s+)?EQUITY\s+HOLDINGS", re.I)),
+        ("fixed", re.compile(
+            r"TOP\s+(?:5\s+)?(?:FIXED\s+INCOME|BOND|SUKUK)\s+HOLDINGS", re.I)),
     ]
-    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines() if x.strip()]
+    stop_heading = re.compile(
+        r"^(?:TOP\s+.*HOLDINGS|SECTOR\s+ALLOCATION|ASSET\s+ALLOCATION|"
+        r"COUNTRY\s+.*ALLOCATION|IMPORTANT\s+INFORMATION)", re.I)
+    result = {"equity": [], "fixed": []}
+
     for kind, heading in headings:
         active = False
+        section = []
         for line in lines:
-            if re.search(heading, line, re.I):
+            if heading.search(line):
                 active = True
                 continue
+            if active and stop_heading.search(line):
+                break
             if active:
-                if re.search(r"TOP\s+.*HOLDINGS|SECTOR\s+ALLOCATION|ASSET\s+ALLOCATION", line, re.I):
-                    break
-                m = re.match(r"(.{3,100}?)\s+(\d{1,2}(?:\.\d{1,2})?)\s*%", line)
+                section.append(line)
+
+        # Join wrapped text but preserve likely row boundaries. First parse
+        # complete rows, then a three-line rank/name/percentage layout.
+        candidates = []
+        for line in section:
+            cleaned = re.sub(r"^\s*\d{1,2}\s*[.)]?\s*", "", line)
+            m = re.search(r"^(.{2,140}?)\s+(\d{1,2}(?:\.\d{1,2})?)\s*%\s*$", cleaned)
+            if m:
+                candidates.append((m.group(1).strip(" -:|"), float(m.group(2))))
+                continue
+
+        if not candidates:
+            idx = 0
+            while idx < len(section):
+                rank_match = re.fullmatch(r"\s*(?:No\.?\s*)?([1-5])\s*[.)]?\s*", section[idx], re.I)
+                if rank_match and idx + 2 < len(section):
+                    name = section[idx + 1].strip(" -:|")
+                    pct_match = re.fullmatch(r"\s*(\d{1,2}(?:\.\d{1,2})?)\s*%\s*", section[idx + 2])
+                    if pct_match and name:
+                        candidates.append((name, float(pct_match.group(1))))
+                        idx += 3
+                        continue
+                idx += 1
+
+        # Some PDF extractors emit "rank name percentage" in a single line.
+        if not candidates:
+            for line in section:
+                m = re.match(
+                    r"^\s*[1-5]\s+(.{2,140}?)\s+(\d{1,2}(?:\.\d{1,2})?)\s*%\s*$",
+                    line)
                 if m:
-                    name = m.group(1).strip(" -:|")
-                    pct = float(m.group(2))
-                    if name and pct <= 100 and not re.search(r"TOTAL|CASH|NAV", name, re.I):
-                        result[kind].append([name, pct])
-                        if len(result[kind]) >= 5:
-                            break
-    result["equity"] = result["equity"][:5]
-    result["fixed"] = result["fixed"][:5]
+                    candidates.append((m.group(1).strip(), float(m.group(2))))
+
+        seen = set()
+        for name, pct in candidates:
+            key = re.sub(r"\s+", " ", name).strip().casefold()
+            if (key and key not in seen and 0 < pct <= 100
+                    and not re.search(r"\b(TOTAL|CASH|NAV|RANK|HOLDING)\b", key)):
+                result[kind].append([re.sub(r"\s+", " ", name).strip(), pct])
+                seen.add(key)
+                if len(result[kind]) == 5:
+                    break
+
     if not result["equity"] and not result["fixed"]:
-        raise RuntimeError("Recognised Top Holdings table not found; snapshot not replaced.")
+        raise RuntimeError(
+            "Top Equity / Top Fixed Income tables were not recognised in this PDF. "
+            "No snapshot was changed.")
     return result
 
 
 def _discover_factsheet_links():
-    """Discover current official PDFs and include known direct factsheet URLs as fallback."""
+    """Discover current Kenanga factsheets from official fund detail pages."""
     links_by_url = {}
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    def add_pdf_links(page_url, page_label=""):
+        try:
+            response = requests.get(page_url, headers=HEADERS, timeout=(6, 12))
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            page_title = soup.title.get_text(" ", strip=True) if soup.title else page_label
+            for anchor in soup.find_all("a", href=True):
+                href = anchor["href"].strip()
+                full = requests.compat.urljoin(page_url, href)
+                if not full.lower().split("?")[0].endswith(".pdf"):
+                    continue
+                label = " ".join([
+                    anchor.get_text(" ", strip=True),
+                    anchor.parent.get_text(" ", strip=True),
+                    page_title or "",
+                    page_label or ""
+                ])
+                # Prefer explicitly labelled fund factsheets. Ignore prospectuses,
+                # annual reports and unrelated PDF links.
+                if re.search(r"fund\s*factsheet|fact\s*sheet|monthly\s*fact", label, re.I):
+                    links_by_url[full] = page_title or page_label or "Official fund factsheet"
+        except Exception:
+            return
+
+    # Current official fund listing links to the individual fund pages. Each
+    # detail page exposes the current factsheet download link.
     try:
-        response = requests.get(KENANGA_DOCUMENTS_URL, headers=HEADERS, timeout=(8, 25))
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            label = " ".join([a.get_text(" ", strip=True), a.parent.get_text(" ", strip=True)])
-            full = requests.compat.urljoin(KENANGA_DOCUMENTS_URL, href)
-            if ".pdf" in full.lower() and re.search(r"fact.?sheet|ffs|monthly", label + " " + full, re.I):
-                links_by_url[full] = label or "Official factsheet listing"
+        listing = session.get(KENANGA_DOCUMENTS_URL, timeout=(8, 25))
+        listing.raise_for_status()
+        soup = BeautifulSoup(listing.text, "html.parser")
+        # Some releases expose direct PDF links on the document-download page.
+        add_pdf_links(KENANGA_DOCUMENTS_URL, "Kenanga official fund documents")
+        detail_pages = set()
+        for anchor in soup.find_all("a", href=True):
+            href = requests.compat.urljoin(KENANGA_DOCUMENTS_URL, anchor["href"].strip())
+            parsed = requests.compat.urlparse(href)
+            if (parsed.netloc.endswith("kenangainvestors.com.my")
+                    and re.search(r"/kenanga-[a-z0-9-]+/?$", parsed.path, re.I)):
+                detail_pages.add(href)
+        # Also inspect the official fund list, which may expose fund pages not
+        # linked from the document-download landing page.
+        fund_list = session.get("https://www.kenangainvestors.com.my/fund-list",
+                                timeout=(8, 25))
+        fund_list.raise_for_status()
+        list_soup = BeautifulSoup(fund_list.text, "html.parser")
+        for anchor in list_soup.find_all("a", href=True):
+            href = requests.compat.urljoin("https://www.kenangainvestors.com.my/fund-list",
+                                           anchor["href"].strip())
+            parsed = requests.compat.urlparse(href)
+            if (parsed.netloc.endswith("kenangainvestors.com.my")
+                    and re.search(r"/kenanga-[a-z0-9-]+/?$", parsed.path, re.I)):
+                detail_pages.add(href)
+        # The app's fund set is deliberately limited; cap crawl size.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(add_pdf_links, sorted(detail_pages)[:40]))
     except Exception:
-        # The official listing may be blocked or JavaScript-rendered on hosted servers.
-        # Known direct PDF links below provide a conservative fallback.
         pass
 
+    # Retain known official direct URLs as fallback for sites/pages that block
+    # server-side discovery. They are not treated as current unless their PDF
+    # date is extracted and validated during sync.
     for fund, url in KNOWN_FACTSHEET_URLS.items():
         links_by_url.setdefault(url, fund)
 
@@ -1231,12 +1330,22 @@ def _factsheet_report_date(pdf_bytes):
 
     months = ("January|February|March|April|May|June|July|August|September|"
               "October|November|December")
-    full_date = re.search(r"\b(\d{1,2})\s+(" + months + r")\s+(20\d{2})\b", body, re.I)
+    full_date = re.search(r"\b(\d{1,2})\s+(" + months + r"),?\s+(20\d{2})\b", body, re.I)
     if full_date:
         return datetime.strptime(
             f"{full_date.group(1)} {full_date.group(2)} {full_date.group(3)}",
             "%d %B %Y"
         ).date().isoformat()
+
+    numeric_date = re.search(r"\b(\d{1,2})[./-](\d{1,2})[./-](20\d{2})\b", body)
+    if numeric_date:
+        try:
+            return datetime.strptime(
+                f"{numeric_date.group(1)}/{numeric_date.group(2)}/{numeric_date.group(3)}",
+                "%d/%m/%Y"
+            ).date().isoformat()
+        except ValueError:
+            pass
 
     month_year = re.search(
         r"\b(20\d{2})\s+(" + months + r")\b|\b(" + months + r")\s+(20\d{2})\b",
