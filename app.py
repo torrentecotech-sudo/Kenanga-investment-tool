@@ -1364,47 +1364,70 @@ def _match_factsheet_fund(label, url):
 
 
 def _factsheet_report_date(pdf_bytes):
-    """Read an explicit report date/month from the first two PDF pages."""
+    """Extract a report date from PDF text using tolerant, explicit date formats."""
     try:
         from pypdf import PdfReader
         import io
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        body = "\n".join((page.extract_text() or "") for page in reader.pages[:2])
+        reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+        body = "\n".join((page.extract_text() or "") for page in reader.pages[:3])
     except Exception as exc:
-        raise RuntimeError(f"PDF report-date extraction failed: {exc}")
+        raise RuntimeError(f"PDF text extraction failed: {type(exc).__name__}: {exc}")
 
+    body = re.sub(r"[\u00a0\u2007\u202f]", " ", body)
+    body = re.sub(r"[ \t]+", " ", body)
     months = ("January|February|March|April|May|June|July|August|September|"
-              "October|November|December")
-    full_date = re.search(r"\b(\d{1,2})\s+(" + months + r"),?\s+(20\d{2})\b", body, re.I)
-    if full_date:
-        return datetime.strptime(
-            f"{full_date.group(1)} {full_date.group(2)} {full_date.group(3)}",
-            "%d %B %Y"
-        ).date().isoformat()
+              "October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|"
+              "Oct|Nov|Dec")
+    candidates = []
 
-    numeric_date = re.search(r"\b(\d{1,2})[./-](\d{1,2})[./-](20\d{2})\b", body)
-    if numeric_date:
-        try:
-            return datetime.strptime(
-                f"{numeric_date.group(1)}/{numeric_date.group(2)}/{numeric_date.group(3)}",
-                "%d/%m/%Y"
-            ).date().isoformat()
-        except ValueError:
-            pass
+    # Day Month Year, including "30 September 2026" and "30 Sep 2026".
+    for m in re.finditer(r"\b(\d{1,2})\s+(" + months + r"),?\.?\s+(20\d{2})\b", body, re.I):
+        candidates.append(f"{m.group(1)} {m.group(2).replace('.', '')} {m.group(3)}")
 
-    month_year = re.search(
-        r"\b(20\d{2})\s+(" + months + r")\b|\b(" + months + r")\s+(20\d{2})\b",
-        body, re.I
-    )
-    if not month_year:
-        raise RuntimeError("Factsheet report month not found in first two PDF pages.")
-    month_text = " ".join(part for part in month_year.groups() if part)
-    for fmt in ("%Y %B", "%B %Y"):
-        try:
-            return datetime.strptime(month_text.title(), fmt).date().isoformat()
-        except ValueError:
-            pass
-    raise RuntimeError("Factsheet report month could not be interpreted.")
+    # Month Day, Year, e.g. "September 30, 2026".
+    for m in re.finditer(r"\b(" + months + r")\.?\s+(\d{1,2}),?\s+(20\d{2})\b", body, re.I):
+        candidates.append(f"{m.group(2)} {m.group(1).replace('.', '')} {m.group(3)}")
+
+    # ISO dates must be handled separately; the previous implementation treated
+    # YYYY-MM-DD as DD-MM-YYYY and then discarded it.
+    for m in re.finditer(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", body):
+        candidates.append(f"{m.group(1)}-{m.group(2)}-{m.group(3)}")
+
+    # Numeric Malaysian dates (DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY).
+    for m in re.finditer(r"\b(\d{1,2})[./-](\d{1,2})[./-](20\d{2})\b", body):
+        candidates.append(f"{m.group(1)}/{m.group(2)}/{m.group(3)}")
+
+    for value in candidates:
+        for fmt in ("%d %B %Y", "%d %b %Y", "%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(value, fmt).date().isoformat()
+            except ValueError:
+                continue
+
+    # Month/year-only factsheets: normalize abbreviated month names as well.
+    month_year_patterns = [
+        (r"\b(20\d{2})\s+(" + months + r")\.?\b", "%Y %B"),
+        (r"\b(" + months + r")\.?\s+(20\d{2})\b", "%B %Y"),
+    ]
+    for pattern, fmt in month_year_patterns:
+        m = re.search(pattern, body, re.I)
+        if m:
+            value = " ".join(m.groups()).replace(".", "")
+            for candidate_fmt in (fmt, fmt.replace("%B", "%b")):
+                try:
+                    parsed = datetime.strptime(value.title(), candidate_fmt)
+                    return parsed.date().replace(day=1).isoformat()
+                except ValueError:
+                    pass
+
+    metadata_date = getattr(getattr(reader, "metadata", None), "creation_date", None) if 'reader' in locals() else None
+    if metadata_date:
+        raise RuntimeError(
+            "No report date found in visible PDF text; PDF metadata date is not used "
+            "because it may be a file-generation date.")
+    sample = re.sub(r"\s+", " ", body[:240]).strip()
+    raise RuntimeError("Could not identify factsheet report date in first 3 PDF pages. "
+                       f"Text sample: {sample or '[no extractable text]'}")
 
 
 _HOLDINGS_LAST_SYNC_AT = None
