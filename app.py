@@ -734,7 +734,11 @@ def refresh_payload():
 
 @app.get("/")
 def index():
-    return render_template("index.html")
+    response = app.make_response(render_template("index.html"))
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @app.get("/api/nav")
@@ -1125,6 +1129,16 @@ HOLDINGS_SYNC_TOKEN = os.environ.get("HOLDINGS_SYNC_TOKEN", "")
 KENANGA_DOCUMENTS_URL = "https://www.kenangainvestors.com.my/fund-document-download"
 KNOWN_FACTSHEET_URLS = {'Kenanga Blue Chip Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/IBC%20FFS.pdf', 'Kenanga Global Islamic Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/KIF%20FFS.pdf', 'Kenanga Islamic Balanced Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/KIBF%20FFS.pdf', 'Kenanga Growth Fund Series 2 (MYR)': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/KGFS2MYR%20FFS.pdf', 'Kenanga Syariah Growth Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/KSGF%20FFS.pdf', 'Kenanga Managed Growth Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/IMG%20FFS.pdf', 'Kenanga Malaysian Inc Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/KMIF%20FFS.pdf', 'Kenanga Premier Fund': 'https://www.kenanga.com.my/wp-content/uploads/kenwealth/PKOCF%20FFS.pdf'}
 
+# Verified FSMOne monthly factsheet PDFs. These supplement (not replace) Kenanga's
+# own official documents when a Kenanga page is blocked or omits a direct PDF link.
+FSMONE_FACTSHEET_URLS = {
+    "Kenanga Growth Fund": "https://www.fsmone.com.my/admin/buy/factsheet/factsheetMYKNGGF.pdf",
+    "Kenanga Syariah Growth Fund": "https://www.fsmone.com.my/admin/buy/factsheet/factsheetMYKNGSGF.pdf",
+    "Kenanga Shariah Growth Opportunities Fund": "https://www.fsmone.com.my/admin/buy/factsheet/factsheetMYKNGSGO.pdf",
+    "Kenanga Growth Fund Series 2 (MYR)": "https://www.fsmone.com.my/admin/buy/factsheet/factsheetMYKNGF2MY.pdf",
+    "Kenanga Islamic Balanced Fund": "https://www.fsmone.com.my/admin/buy/factsheet/factsheetMYKNGIBF.pdf",
+}
+
 @app.get("/api/holdings")
 def api_holdings():
     """Return latest verified factsheet snapshot per fund."""
@@ -1287,12 +1301,29 @@ def _discover_factsheet_links():
             if (parsed.netloc.endswith("kenangainvestors.com.my")
                     and re.search(r"/kenanga-[a-z0-9-]+/?$", parsed.path, re.I)):
                 detail_pages.add(href)
-        # The app's fund set is deliberately limited; cap crawl size.
+        # Also derive likely official detail-page slugs from every fund in the
+        # app's own master list. This prevents the crawler from being limited to
+        # whichever 8 links happen to be exposed on the documents landing page.
+        for fund in KENANGA_MAPPING:
+            slug = re.sub(r"[^a-z0-9]+", "-", fund.lower()).strip("-")
+            # Kenanga uses "syariah" in several URL slugs and omits class suffixes.
+            candidates = {
+                "https://www.kenangainvestors.com.my/kenanga-" + slug,
+            }
+            if "syariah" in slug:
+                candidates.add("https://www.kenangainvestors.com.my/kenanga-" + slug.replace("syariah", "shariah"))
+            for candidate in candidates:
+                detail_pages.add(candidate)
+
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            list(pool.map(add_pdf_links, sorted(detail_pages)[:40]))
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            list(pool.map(add_pdf_links, sorted(detail_pages)))
     except Exception:
         pass
+
+    # Add verified FSMOne factsheet PDFs as a second source for the same fund.
+    for fund, url in FSMONE_FACTSHEET_URLS.items():
+        links_by_url.setdefault(url, fund)
 
     # Retain known official direct URLs as fallback for sites/pages that block
     # server-side discovery. They are not treated as current unless their PDF
@@ -1310,12 +1341,26 @@ def _match_factsheet_fund(label, url):
             return fund
 
     hay = re.sub(r"[^a-z0-9]+", " ", (label + " " + url).lower()).strip()
+    aliases = {
+        "Kenanga Shariah Growth Opportunities Fund": [
+            "Kenanga Shariah Growth Opportunities Fund", "Kenanga Syariah Growth Opportunities Fund"
+        ],
+        "Kenanga Syariah Growth Fund": ["Kenanga Syariah Growth Fund", "Kenanga Shariah Growth Fund"],
+        "Kenanga Malaysian Inc Fund": ["Kenanga Malaysian Inc Fund", "Kenanga Malaysian Inc"],
+        "Kenanga Islamic Asia Pacific (ex Japan) Total Return Fund": [
+            "Kenanga Islamic Asia Pacific (ex Japan) Total Return Fund",
+            "Kenanga Asia Pacific Total Return Fund"
+        ],
+    }
     matches = []
     for fund in KENANGA_MAPPING:
-        key = re.sub(r"[^a-z0-9]+", " ", fund.lower()).strip()
-        if key and re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])", hay):
-            matches.append(fund)
-    return matches[0] if len(matches) == 1 else None
+        names = [fund] + aliases.get(fund, [])
+        for name in names:
+            key = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+            if key and re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])", hay):
+                matches.append(fund)
+                break
+    return matches[0] if len(set(matches)) == 1 else None
 
 
 def _factsheet_report_date(pdf_bytes):
