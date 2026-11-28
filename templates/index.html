@@ -88,10 +88,6 @@ function calc(){
   set('newAverageNav',totalUnits>0?'RM '+fmt(newAverage,4):'—');
   set('recoveryPct',totalCost>0?(recoveryPct>=0?'+':'')+fmt(recoveryPct,2)+'%':'—');
   set('recoveryValue','Value at previous purchase NAV: '+(previousPurchaseNav>0?rm(recoveryValue):'—'));
-  const trend=(id,value)=>{let el=$(id);if(el)el.className=value>0?'positive':value<0?'negative':'';};
-  trend('beforeCaPct',withoutReturn);
-  trend('afterCaPct',afterReturn);
-  trend('recoveryPct',recoveryProfit);
 }
 $('existingCost').addEventListener('input',calc);$('existingAvgNav').addEventListener('input',calc);$('addTx').onclick=()=>{transactions.push({amount:'',nav:$('currentNav').value||'',charge:true});renderTx();calc()};$('applyCurrentNav').onclick=()=>{let nav=$('currentNav').value;if(!(Number(nav)>0)){alert('Select a fund with a valid current NAV first.');return;}transactions.forEach(t=>t.nav=nav);renderTx();calc();};['currentNav','serviceRate','sstRate','existingCost','existingAvgNav'].forEach(id=>$(id).oninput=calc);$('calcFund').onchange=()=>{let f=funds.find(x=>x.name===$('calcFund').value);$('currentNav').value=f?.nav??'';transactions.forEach(t=>{if(!t.nav)t.nav=f?.nav??''});renderTx();calc()};
 renderFunds();renderTx();calc();
